@@ -1,0 +1,46 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "InSyncBee",
+  "version": "0.1.0",
+  "identifier": "com.insyncbee.app",
+  "build": {
+    "frontendDist": "../ui/dist",
+    "devUrl": "http://localhost:3000",
+    "beforeDevCommand": "cd ../ui && pnpm dev",
+    "beforeBuildCommand": "cd ../ui && pnpm build"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "InSyncBee",
+        "label": "main",
+        "width": 900,
+        "height": 650,
+        "minWidth": 700,
+        "minHeight": 500,
+        "resizable": true,
+        "visible": false
+      }
+    ],
+    "trayIcon": {
+      "iconPath": "icons/32x32.png",
+      "iconAsTemplate": true,
+      "tooltip": "InSyncBee - Google Drive Sync"
+    },
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

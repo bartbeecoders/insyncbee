@@ -1,0 +1,61 @@
+[workspace]
+members = [
+    "crates/insyncbee-core",
+    "crates/insyncbee-daemon",
+    "src-tauri",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Bart Roelant"]
+license = "MIT"
+rust-version = "1.77.2"
+
+[workspace.dependencies]
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# HTTP
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# Database
+rusqlite = { version = "0.34", features = ["bundled"] }
+
+# Hashing
+blake3 = "1"
+
+# File watching
+notify = "8"
+notify-debouncer-full = "0.5"
+
+# OAuth2
+oauth2 = "5"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# UUID
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Directories
+dirs = "6"
+
+# Internal
+insyncbee-core = { path = "crates/insyncbee-core" }
