@@ -1,0 +1,76 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: insyncbee-portal
+  namespace: insyncbee
+  labels:
+    app: insyncbee-portal
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: insyncbee-portal
+  template:
+    metadata:
+      labels:
+        app: insyncbee-portal
+    spec:
+      containers:
+        - name: portal
+          image: ghcr.io/bartbeecoders/insyncbee-portal:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: "20m"
+              memory: "32Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+          volumeMounts:
+            - name: releases
+              mountPath: /usr/share/nginx/html/releases
+              readOnly: true
+      volumes:
+        - name: releases
+          hostPath:
+            # Populated by scripts/upload-release.sh
+            path: /srv/insyncbee/releases
+            type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: insyncbee-portal
+  namespace: insyncbee
+  labels:
+    app: insyncbee-portal
+spec:
+  type: NodePort
+  selector:
+    app: insyncbee-portal
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      nodePort: 32081

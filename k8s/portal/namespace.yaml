@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: insyncbee
+  labels:
+    app.kubernetes.io/name: insyncbee
+    app.kubernetes.io/part-of: insyncbee-portal

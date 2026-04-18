@@ -1,0 +1,53 @@
+---
+# k3s ships Traefik by default; this Ingress works with either Traefik or nginx-ingress.
+# Assumes cert-manager is installed and a ClusterIssuer named "letsencrypt-prod" exists.
+# If not: remove the TLS block and the cert-manager annotation, or adapt to your setup.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: insyncbee-portal
+  namespace: insyncbee
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    # Traefik: allow downloads up to 200 MB through the proxy
+    traefik.ingress.kubernetes.io/router.middlewares: insyncbee-bigbody@kubernetescrd
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - insyncbee.dev
+        - www.insyncbee.dev
+      secretName: insyncbee-tls
+  rules:
+    - host: insyncbee.dev
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: insyncbee-portal
+                port:
+                  number: 80
+    - host: www.insyncbee.dev
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: insyncbee-portal
+                port:
+                  number: 80
+---
+# Traefik middleware: raise buffer limits so large download responses
+# stream through without 413s.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: bigbody
+  namespace: insyncbee
+spec:
+  buffering:
+    maxRequestBodyBytes: 10485760        # 10 MB for form posts
+    maxResponseBodyBytes: 524288000      # 500 MB to cover any installer

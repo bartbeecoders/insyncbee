@@ -1,0 +1,54 @@
+{
+  "version": "0.1.0",
+  "channel": "dev",
+  "releasedAt": "2026-04-18",
+  "product": "insyncbee-db-service",
+  "repo": "bartbeecoders/insyncbee",
+  "platforms": [
+    {
+      "os": "linux",
+      "displayName": "Linux",
+      "requirement": "glibc 2.35+ (Ubuntu 22.04+, Fedora 38+, Arch)",
+      "artifacts": [
+        {
+          "kind": "tar.gz",
+          "label": "Linux x86_64 (tar.gz)",
+          "arch": "x86_64",
+          "filename": "insyncbee-db-service-0.1.0-linux-x86_64.tar.gz"
+        }
+      ]
+    },
+    {
+      "os": "mac",
+      "displayName": "macOS",
+      "requirement": "macOS 12 Monterey or later",
+      "artifacts": [
+        {
+          "kind": "tar.gz",
+          "label": "Apple Silicon (tar.gz)",
+          "arch": "aarch64",
+          "filename": "insyncbee-db-service-0.1.0-macos-aarch64.tar.gz"
+        },
+        {
+          "kind": "tar.gz",
+          "label": "Intel (tar.gz)",
+          "arch": "x86_64",
+          "filename": "insyncbee-db-service-0.1.0-macos-x86_64.tar.gz"
+        }
+      ]
+    },
+    {
+      "os": "windows",
+      "displayName": "Windows",
+      "requirement": "Windows 10 1809 or later",
+      "artifacts": [
+        {
+          "kind": "zip",
+          "label": "Windows x86_64 (zip)",
+          "arch": "x86_64",
+          "filename": "insyncbee-db-service-0.1.0-windows-x86_64.zip"
+        }
+      ]
+    }
+  ]
+}
