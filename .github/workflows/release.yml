@@ -67,10 +67,9 @@ jobs:
             runner: macos-14
             target: aarch64-apple-darwin
             archive: tar.gz
-          - label: macos-x86_64
-            runner: macos-13
-            target: x86_64-apple-darwin
-            archive: tar.gz
+          # Intel Mac (macos-13) runners are scarce on free GitHub Actions and
+          # Intel Mac usage is shrinking — Apple Silicon users are covered by
+          # macos-aarch64. Re-add a `macos-x86_64` entry here if needed.
           - label: windows-x86_64
             runner: windows-2022
             target: x86_64-pc-windows-msvc

@@ -59,12 +59,6 @@ export const DEFAULT_RELEASES: Releases = {
           arch: "aarch64",
           filename: "insyncbee-db-service-0.1.0-macos-aarch64.tar.gz",
         },
-        {
-          kind: "tar.gz",
-          label: "Intel (tar.gz)",
-          arch: "x86_64",
-          filename: "insyncbee-db-service-0.1.0-macos-x86_64.tar.gz",
-        },
       ],
     },
     {
