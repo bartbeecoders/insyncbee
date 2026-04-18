@@ -104,11 +104,24 @@ impl SyncEngine {
             .collect();
 
         // 4. Compute sync actions via three-way comparison
-        let actions = self.compute_actions(&local_map, &remote_map, &base_map, &local_root);
+        let mut actions = self.compute_actions(&local_map, &remote_map, &base_map, &local_root);
+
+        // 4b. Sort so dependencies are respected:
+        //     creates → file ops → deletes (children-first) → conflicts → skips
+        sort_actions(&mut actions);
+
+        // 4c. Track every known remote folder by relative path so child
+        //     uploads can find their parent's drive ID even when the parent
+        //     was created earlier in the same sync.
+        let mut remote_ids: HashMap<String, String> = remote_map
+            .iter()
+            .filter(|(_, f)| f.is_folder())
+            .map(|(p, f)| (p.clone(), f.id.clone()))
+            .collect();
 
         // 5. Execute actions
         for action in &actions {
-            match self.execute_action(action, drive, &local_root).await {
+            match self.execute_action(action, drive, &local_root, &mut remote_ids).await {
                 Ok(()) => match action {
                     SyncAction::Upload { relative_path, .. }
                     | SyncAction::UpdateRemote { relative_path, .. } => {
@@ -388,11 +401,18 @@ impl SyncEngine {
     }
 
     /// Execute a single sync action.
+    ///
+    /// `remote_ids` maps relative_path → drive folder ID for every folder
+    /// known to exist on the remote at this moment in the sync — including
+    /// folders just created earlier in the same sync. The Upload arm
+    /// consults it so a child uploaded after its parent was created lands
+    /// in the right folder instead of falling back to the sync root.
     async fn execute_action(
         &self,
         action: &SyncAction,
         drive: &dyn DriveClient,
         _local_root: &Path,
+        remote_ids: &mut HashMap<String, String>,
     ) -> anyhow::Result<()> {
         match action {
             SyncAction::Upload {
@@ -405,8 +425,15 @@ impl SyncEngine {
                     .unwrap_or_default()
                     .to_string_lossy()
                     .to_string();
-                tracing::info!("Uploading: {relative_path}");
-                let file = drive.upload_file(remote_parent_id, &name, local_path).await?;
+                // Re-resolve the parent at execute time: the
+                // remote_parent_id snapshotted by compute_actions can be
+                // stale when this child's parent folder was itself created
+                // earlier in the same sync.
+                let parent_id = self
+                    .resolve_parent_runtime(relative_path, remote_ids)
+                    .unwrap_or_else(|| remote_parent_id.clone());
+                tracing::info!("Uploading: {relative_path} (parent {parent_id})");
+                let file = drive.upload_file(&parent_id, &name, local_path).await?;
                 self.update_index(relative_path, local_path, &file)?;
             }
             SyncAction::UpdateRemote {
@@ -495,12 +522,20 @@ impl SyncEngine {
                 remote_parent_id,
                 name,
             } => {
-                tracing::info!("Creating remote dir: {relative_path}");
-                let created = drive.create_folder(remote_parent_id, name).await?;
-                // Same as above, but for the local-originated direction:
-                // without an index entry, deleting the folder locally would
-                // be re-discovered as a brand-new remote folder on the next
-                // sync.
+                // Same execute-time parent resolution as Upload — handles
+                // nested local-originated folders (a/b/c) where b is also
+                // brand-new in this same sync.
+                let parent_id = self
+                    .resolve_parent_runtime(relative_path, remote_ids)
+                    .unwrap_or_else(|| remote_parent_id.clone());
+                tracing::info!("Creating remote dir: {relative_path} (parent {parent_id})");
+                let created = drive.create_folder(&parent_id, name).await?;
+                // Register the new folder so subsequent uploads / nested
+                // CreateRemoteDir actions can resolve it as their parent.
+                remote_ids.insert(relative_path.clone(), created.id.clone());
+                // Index the folder so a later local delete is detected as
+                // (false, true, true) → DeleteRemote instead of being
+                // re-discovered as a brand-new remote folder.
                 self.update_index(relative_path, local_path, &created)?;
             }
             SyncAction::Conflict {
@@ -634,7 +669,8 @@ impl SyncEngine {
             .map(|e| (e.relative_path.clone(), e))
             .collect();
 
-        let actions = self.compute_actions(&local_map, &remote_map, &base_map, &local_root);
+        let mut actions = self.compute_actions(&local_map, &remote_map, &base_map, &local_root);
+        sort_actions(&mut actions);
 
         let mut report = SyncReport::default();
         for action in &actions {
@@ -747,6 +783,27 @@ impl SyncEngine {
         }
     }
 
+    /// Resolve the parent's drive ID using a runtime path → id map that
+    /// includes folders just created earlier in this same sync. Returns
+    /// `Some(self.pair.remote_root_id)` for top-level entries.
+    ///
+    /// Returns `None` only when the path has a non-empty parent that we
+    /// genuinely don't know about — callers fall back to the parent ID
+    /// snapshotted at compute time.
+    fn resolve_parent_runtime(
+        &self,
+        relative_path: &str,
+        remote_ids: &HashMap<String, String>,
+    ) -> Option<String> {
+        match Path::new(relative_path).parent() {
+            Some(p) if !p.as_os_str().is_empty() => {
+                let key = p.to_string_lossy().to_string();
+                remote_ids.get(&key).cloned()
+            }
+            _ => Some(self.pair.remote_root_id.clone()),
+        }
+    }
+
     fn log_change(&self, path: &str, action: &str, detail: Option<&str>) {
         let _ = self.db.with_conn(|conn| {
             ChangeLogEntry::insert(conn, &self.pair.id, path, action, detail)?;
@@ -770,6 +827,35 @@ impl SyncAction {
             Self::Skip { relative_path, reason } => format!("  · Skip: {relative_path} ({reason})"),
         }
     }
+}
+
+/// Order actions so dependencies always resolve:
+///
+/// 1. Folder creates first, **shallowest first** so a child folder's parent
+///    has already been created (and registered in `remote_ids`) when its
+///    own create runs.
+/// 2. File ops next.
+/// 3. Deletes last, **deepest first** so a `remove_dir_all` doesn't precede
+///    its children's individual delete actions and turn them into NotFound
+///    errors. (We tolerate NotFound anyway, but ordering keeps the logs clean.)
+/// 4. Conflicts and Skips at the end — they don't mutate either side, so
+///    their position only affects log readability.
+fn sort_actions(actions: &mut Vec<SyncAction>) {
+    actions.sort_by_key(|a| {
+        let path = action_path(a).unwrap_or_default();
+        let depth = path.matches(std::path::MAIN_SEPARATOR).count() as i64
+            + path.matches('/').count() as i64;
+        let (bucket, depth_key): (i32, i64) = match a {
+            SyncAction::CreateLocalDir { .. } | SyncAction::CreateRemoteDir { .. } => (0, depth),
+            SyncAction::Upload { .. }
+            | SyncAction::UpdateRemote { .. }
+            | SyncAction::Download { .. } => (1, depth),
+            SyncAction::DeleteLocal { .. } | SyncAction::DeleteRemote { .. } => (2, -depth),
+            SyncAction::Conflict { .. } => (3, depth),
+            SyncAction::Skip { .. } => (4, depth),
+        };
+        (bucket, depth_key, path)
+    });
 }
 
 fn action_path(action: &SyncAction) -> Option<String> {

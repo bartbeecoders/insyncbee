@@ -222,6 +222,80 @@ async fn remote_delete_propagates_to_local_in_two_way() {
     assert!(!fx.local_path().join("remote-doomed.txt").exists());
 }
 
+// ── New-folder-with-children parent ID resolution ───────────────────
+
+#[tokio::test]
+async fn new_local_folder_with_child_uploads_into_the_new_folder_not_root() {
+    // Regression: child files were being uploaded into the sync root
+    // because compute_actions snapshots the parent ID from the start-of-sync
+    // remote map (where the just-created folder doesn't exist yet).
+    let fx = SyncFixture::new(SyncMode::TwoWay);
+    fx.write_local("parent/child.txt", "hello");
+
+    let engine = SyncEngine::new(fx.db.clone(), fx.pair.clone());
+    let report = engine.sync(&fx.fake).await.unwrap();
+    assert_eq!(report.errors, 0);
+
+    let snap = fx.fake.snapshot_by_name();
+    let parent = snap.get("parent").expect("parent folder must exist on remote");
+    assert!(parent.meta.mime_type.contains("folder"));
+
+    let child = snap.get("child.txt").expect("child file must exist on remote");
+    let child_parents = child.meta.parents.clone().unwrap_or_default();
+    assert!(
+        child_parents.contains(&parent.meta.id),
+        "child.txt should sit inside the new 'parent' folder, not the sync root. \
+         Got parents={child_parents:?}, parent_id={}",
+        parent.meta.id
+    );
+    assert!(
+        !child_parents.contains(&fx.remote_root),
+        "child.txt must NOT be under the sync root"
+    );
+}
+
+#[tokio::test]
+async fn deeply_nested_new_local_dirs_resolve_each_other_as_parents() {
+    let fx = SyncFixture::new(SyncMode::TwoWay);
+    fx.write_local("a/b/c/leaf.txt", "deep");
+
+    let engine = SyncEngine::new(fx.db.clone(), fx.pair.clone());
+    let report = engine.sync(&fx.fake).await.unwrap();
+    assert_eq!(report.errors, 0);
+
+    let snap = fx.fake.snapshot_by_name();
+    let a = snap.get("a").expect("a should exist");
+    let b = snap.get("b").expect("b should exist");
+    let c = snap.get("c").expect("c should exist");
+    let leaf = snap.get("leaf.txt").expect("leaf.txt should exist");
+
+    assert!(a.meta.parents.as_deref().unwrap_or_default().contains(&fx.remote_root));
+    assert!(b.meta.parents.as_deref().unwrap_or_default().contains(&a.meta.id),
+        "b's parent should be a, not the sync root");
+    assert!(c.meta.parents.as_deref().unwrap_or_default().contains(&b.meta.id),
+        "c's parent should be b, not the sync root");
+    assert!(leaf.meta.parents.as_deref().unwrap_or_default().contains(&c.meta.id),
+        "leaf.txt's parent should be c, not the sync root");
+}
+
+#[tokio::test]
+async fn second_sync_after_new_nested_upload_is_a_noop() {
+    // After the first sync correctly nests everything, the second sync
+    // should see no changes anywhere — exercises that update_index recorded
+    // every level (folders + leaf) with the correct remote IDs.
+    let fx = SyncFixture::new(SyncMode::TwoWay);
+    fx.write_local("nested/deep/file.txt", "x");
+
+    let engine = SyncEngine::new(fx.db.clone(), fx.pair.clone());
+    engine.sync(&fx.fake).await.unwrap();
+    let report = engine.sync(&fx.fake).await.unwrap();
+    assert_eq!(report.uploaded, 0, "second sync must not re-upload anything");
+    assert_eq!(report.downloaded, 0, "second sync must not re-download anything");
+    assert_eq!(report.deleted, 0);
+    assert_eq!(report.conflicts, 0);
+    assert_eq!(report.errors, 0);
+}
+
 // ── Mode restrictions ───────────────────────────────────────────────
 
 #[tokio::test]
