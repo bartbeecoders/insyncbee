@@ -40,9 +40,14 @@ pub enum SyncAction {
     CreateLocalDir {
         relative_path: String,
         local_path: PathBuf,
+        // Carry the source DriveFile so we can index the new directory and
+        // detect later remote deletions (otherwise the folder is re-uploaded
+        // on the next sync).
+        remote: DriveFile,
     },
     CreateRemoteDir {
         relative_path: String,
+        local_path: PathBuf,
         remote_parent_id: String,
         name: String,
     },
@@ -183,6 +188,7 @@ impl SyncEngine {
                         if self.pair.mode != SyncMode::CloudToLocal {
                             SyncAction::CreateRemoteDir {
                                 relative_path: path.clone(),
+                                local_path: local_root.join(path),
                                 remote_parent_id: self.resolve_remote_parent_id(path, remote).to_string(),
                                 name: Path::new(path)
                                     .file_name()
@@ -217,6 +223,7 @@ impl SyncEngine {
                             SyncAction::CreateLocalDir {
                                 relative_path: path.clone(),
                                 local_path: local_root.join(path),
+                                remote: file.clone(),
                             }
                         } else {
                             SyncAction::Skip {
@@ -426,10 +433,22 @@ impl SyncEngine {
                 local_path,
             } => {
                 tracing::info!("Deleting local: {relative_path}");
+                // Be tolerant of already-gone targets: when a folder delete
+                // runs first, its children's actions still fire afterwards
+                // but the paths no longer exist. We still want the index
+                // cleaned up, not a spurious error.
                 if local_path.is_dir() {
-                    tokio::fs::remove_dir_all(local_path).await?;
-                } else {
-                    tokio::fs::remove_file(local_path).await?;
+                    if let Err(e) = tokio::fs::remove_dir_all(local_path).await {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            return Err(e.into());
+                        }
+                    }
+                } else if local_path.exists() {
+                    if let Err(e) = tokio::fs::remove_file(local_path).await {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            return Err(e.into());
+                        }
+                    }
                 }
                 self.db.with_conn(|conn| {
                     FileEntry::delete_by_path(conn, &self.pair.id, relative_path)?;
@@ -441,7 +460,18 @@ impl SyncEngine {
                 remote_id,
             } => {
                 tracing::info!("Trashing remote: {relative_path}");
-                drive.trash_file(remote_id).await?;
+                // Trashing a folder cascades to its contents on Drive's side,
+                // so child trash calls afterwards may 404. Treat that as
+                // success — we still want the local index cleaned up.
+                if let Err(e) = drive.trash_file(remote_id).await {
+                    let msg = e.to_string();
+                    let already_gone = msg.contains("404")
+                        || msg.contains("notFound")
+                        || msg.contains("not found");
+                    if !already_gone {
+                        return Err(e);
+                    }
+                }
                 self.db.with_conn(|conn| {
                     FileEntry::delete_by_path(conn, &self.pair.id, relative_path)?;
                     Ok(())
@@ -450,17 +480,28 @@ impl SyncEngine {
             SyncAction::CreateLocalDir {
                 relative_path,
                 local_path,
+                remote,
             } => {
                 tracing::info!("Creating local dir: {relative_path}");
                 tokio::fs::create_dir_all(local_path).await?;
+                // Index the new directory so a later remote-side delete is
+                // detected as (true, false, true) → DeleteLocal instead of
+                // (true, false, false) → re-upload.
+                self.update_index(relative_path, local_path, remote)?;
             }
             SyncAction::CreateRemoteDir {
                 relative_path,
+                local_path,
                 remote_parent_id,
                 name,
             } => {
                 tracing::info!("Creating remote dir: {relative_path}");
-                drive.create_folder(remote_parent_id, name).await?;
+                let created = drive.create_folder(remote_parent_id, name).await?;
+                // Same as above, but for the local-originated direction:
+                // without an index entry, deleting the folder locally would
+                // be re-discovered as a brand-new remote folder on the next
+                // sync.
+                self.update_index(relative_path, local_path, &created)?;
             }
             SyncAction::Conflict {
                 relative_path,

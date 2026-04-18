@@ -118,6 +118,94 @@ async fn local_delete_propagates_to_remote_in_two_way() {
 }
 
 #[tokio::test]
+async fn remote_folder_delete_propagates_to_local_in_two_way() {
+    // Regression test for the v0.1.5 bug: deleting a folder remotely caused
+    // the folder to be re-uploaded instead of removed locally, because
+    // CreateLocalDir / CreateRemoteDir never wrote a base-state entry.
+    let fx = SyncFixture::new(SyncMode::TwoWay);
+
+    // Arrange: a folder containing a file lives on the remote.
+    let folder_id = fx.fake.insert_folder("photos", Some(&fx.remote_root));
+    fx.fake
+        .insert_file("a.jpg", &folder_id, b"image bytes".to_vec());
+
+    let engine = SyncEngine::new(fx.db.clone(), fx.pair.clone());
+    engine.sync(&fx.fake).await.unwrap();
+
+    // After the first sync the folder + file should be local…
+    let local_folder = fx.local_path().join("photos");
+    assert!(local_folder.is_dir(), "remote folder should have been created locally");
+    assert!(local_folder.join("a.jpg").exists());
+
+    // …and the folder itself must be present in the index, otherwise the
+    // next sync mis-categorises a remote delete as a brand-new local folder.
+    let entries = fx
+        .db
+        .with_conn(|c| FileEntry::list_by_sync_pair(c, &fx.pair.id))
+        .unwrap();
+    let folder_entry = entries
+        .iter()
+        .find(|e| e.relative_path == "photos")
+        .expect("folder must be indexed after CreateLocalDir");
+    assert!(folder_entry.is_directory);
+
+    // Act: trash both the file and the folder on the remote.
+    fx.fake
+        .trash_file(&fx.fake.snapshot_by_name().get("a.jpg").unwrap().meta.id)
+        .await
+        .unwrap();
+    fx.fake.trash_file(&folder_id).await.unwrap();
+
+    // Re-sync.
+    let report = engine.sync(&fx.fake).await.unwrap();
+
+    // Assert: folder is gone locally, no errors, no spurious re-uploads.
+    assert!(!local_folder.exists(), "local folder should have been deleted");
+    assert_eq!(report.uploaded, 0, "must NOT re-upload the deleted folder");
+    assert_eq!(report.errors, 0);
+    assert!(report.deleted >= 1);
+    assert!(fx.fake.snapshot_by_name().get("photos").is_none());
+}
+
+#[tokio::test]
+async fn local_folder_delete_propagates_to_remote_in_two_way() {
+    // Empty folder — keeps this test focused on folder-delete propagation
+    // and avoids the orthogonal parent-id-resolution bug for new local
+    // folders that contain children (filed separately).
+    let fx = SyncFixture::new(SyncMode::TwoWay);
+    std::fs::create_dir(fx.local_path().join("empty-dir")).unwrap();
+
+    let engine = SyncEngine::new(fx.db.clone(), fx.pair.clone());
+    engine.sync(&fx.fake).await.unwrap();
+    assert!(
+        fx.fake.snapshot_by_name().get("empty-dir").is_some(),
+        "remote should now have the folder",
+    );
+
+    // The locally-originated folder must be indexed so a later delete is
+    // recognised as (false, true, true) → DeleteRemote, not (false, true,
+    // false) → re-download.
+    let entries = fx
+        .db
+        .with_conn(|c| FileEntry::list_by_sync_pair(c, &fx.pair.id))
+        .unwrap();
+    assert!(
+        entries.iter().any(|e| e.relative_path == "empty-dir" && e.is_directory),
+        "locally-created folder must be indexed after CreateRemoteDir"
+    );
+
+    std::fs::remove_dir_all(fx.local_path().join("empty-dir")).unwrap();
+    let report = engine.sync(&fx.fake).await.unwrap();
+
+    assert!(
+        fx.fake.snapshot_by_name().get("empty-dir").is_none(),
+        "remote folder should be trashed",
+    );
+    assert_eq!(report.downloaded, 0, "must NOT re-download the deleted folder");
+    assert_eq!(report.errors, 0);
+}
+
+#[tokio::test]
 async fn remote_delete_propagates_to_local_in_two_way() {
     let fx = SyncFixture::new(SyncMode::TwoWay);
     let id = fx
