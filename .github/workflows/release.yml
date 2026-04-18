@@ -8,9 +8,9 @@ name: Build & Deploy Release
 #   4. Upload the binaries to the VPS hostPath that the portal pod serves
 #   5. Roll the portal deployment so it picks up the new image and binaries
 #
-# Required repository secrets (already configured for sqail on this VPS):
-#   ACR_USERNAME, ACR_PASSWORD       — Azure Container Registry credentials
-#   VPS_HOST, VPS_USER, VPS_SSH_KEY  — SSH access to the k3s VPS (NOPASSWD sudo)
+# Required repository secrets:
+#   ACR_USERNAME, ACR_PASSWORD                                     — Azure Container Registry credentials
+#   K3S_SSH_HOST, K3S_SSH_USER, K3S_SSH_PRIVATE_KEY                — SSH access to the k3s VPS
 
 on:
   push:
@@ -204,9 +204,9 @@ jobs:
       - name: Upload to VPS
         uses: appleboy/scp-action@v0.1.7
         with:
-          host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          key: ${{ secrets.VPS_SSH_KEY }}
+          host: ${{ secrets.K3S_SSH_HOST }}
+          username: ${{ secrets.K3S_SSH_USER }}
+          key: ${{ secrets.K3S_SSH_PRIVATE_KEY }}
           source: "artifacts/*"
           target: ${{ env.VPS_RELEASES_DIR }}
           strip_components: 1
@@ -214,9 +214,9 @@ jobs:
       - name: Generate manifest on VPS
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          key: ${{ secrets.VPS_SSH_KEY }}
+          host: ${{ secrets.K3S_SSH_HOST }}
+          username: ${{ secrets.K3S_SSH_USER }}
+          key: ${{ secrets.K3S_SSH_PRIVATE_KEY }}
           script: |
             cd ${{ env.VPS_RELEASES_DIR }}
             FILES=$(ls -1 insyncbee-db-service-* 2>/dev/null | jq -R -s 'split("\n") | map(select(length > 0))')
@@ -260,9 +260,9 @@ jobs:
       - name: Deploy to K3S
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          key: ${{ secrets.VPS_SSH_KEY }}
+          host: ${{ secrets.K3S_SSH_HOST }}
+          username: ${{ secrets.K3S_SSH_USER }}
+          key: ${{ secrets.K3S_SSH_PRIVATE_KEY }}
           script: |
             if command -v kubectl >/dev/null 2>&1; then
               KUBECTL="kubectl"
