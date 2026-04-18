@@ -5,3 +5,8 @@ dist-ts
 *.log
 .env*
 .DS_Store
+
+# Test runners
+test-results/
+playwright-report/
+.playwright/

@@ -1,0 +1,106 @@
+name: Test
+
+# Runs the full test suite on every PR and on every push to main.
+#
+# Layers exercised here mirror tests/README.md:
+#   * cargo test --workspace          → Rust unit + integration + CLI smoke
+#   * pnpm test (vitest)              → portal helper unit tests
+#   * pnpm test:e2e (playwright)      → portal smoke against the built bundle
+#
+# The release workflow (release.yml) does NOT re-run tests — it assumes main
+# is green. Block tag-based releases by failing this workflow on PRs.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: cargo test (workspace)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build workspace
+        run: cargo build --workspace --tests --locked
+
+      - name: Run tests
+        run: cargo test --workspace --locked --no-fail-fast
+
+  portal-unit:
+    name: vitest (portal)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: insyncbee.portal/pnpm-lock.yaml
+
+      - name: Install
+        working-directory: insyncbee.portal
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        working-directory: insyncbee.portal
+        run: pnpm typecheck
+
+      - name: Vitest
+        working-directory: insyncbee.portal
+        run: pnpm test
+
+  portal-e2e:
+    name: playwright (portal)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: insyncbee.portal/pnpm-lock.yaml
+
+      - name: Install
+        working-directory: insyncbee.portal
+        run: pnpm install --frozen-lockfile
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: pw-${{ runner.os }}-${{ hashFiles('insyncbee.portal/pnpm-lock.yaml') }}
+
+      - name: Install Playwright browsers
+        working-directory: insyncbee.portal
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Build portal
+        working-directory: insyncbee.portal
+        run: pnpm build
+
+      - name: Playwright
+        working-directory: insyncbee.portal
+        run: pnpm test:e2e
+
+      - name: Upload trace artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-trace
+          path: insyncbee.portal/test-results/
+          retention-days: 7

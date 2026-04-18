@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use insyncbee_core::auth::{AuthManager, OAuthCredentials};
 use insyncbee_core::db::models::{ConflictPolicy, SyncMode, SyncPair, SyncPairStatus};
 use insyncbee_core::db::Database;
-use insyncbee_core::drive::DriveClient;
+use insyncbee_core::drive::HttpDriveClient;
 use insyncbee_core::sync_engine::{SyncAction, SyncEngine};
 use insyncbee_core::watcher::FileWatcher;
 use insyncbee_core::AppPaths;
@@ -247,7 +247,7 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 let auth = AuthManager::new(creds.clone(), db.clone());
-                let drive = DriveClient::new(auth, p.account_id.clone());
+                let drive = HttpDriveClient::new(auth, p.account_id.clone());
                 let engine = SyncEngine::new(db.clone(), p.clone());
 
                 if dry_run {
@@ -368,7 +368,7 @@ async fn run_daemon(db: Database) -> anyhow::Result<()> {
     // Do an initial sync for all pairs
     for pair in &active_pairs {
         let auth = AuthManager::new(creds.clone(), db.clone());
-        let drive = DriveClient::new(auth, pair.account_id.clone());
+        let drive = HttpDriveClient::new(auth, pair.account_id.clone());
         let engine = SyncEngine::new(db.clone(), pair.clone());
 
         tracing::info!("Initial sync for '{}'...", pair.name);
@@ -404,7 +404,7 @@ async fn run_daemon(db: Database) -> anyhow::Result<()> {
                         last_poll.insert(pair.id.clone(), now);
 
                         let auth = AuthManager::new(creds.clone(), db.clone());
-                        let drive = DriveClient::new(auth, pair.account_id.clone());
+                        let drive = HttpDriveClient::new(auth, pair.account_id.clone());
                         let engine = SyncEngine::new(db.clone(), pair.clone());
 
                         tracing::debug!("Polling remote changes for '{}'...", pair.name);
@@ -430,7 +430,7 @@ async fn run_daemon(db: Database) -> anyhow::Result<()> {
                     // Find the pair and trigger sync
                     if let Some(pair) = active_pairs.iter().find(|p| p.id == *pair_id) {
                         let auth = AuthManager::new(creds.clone(), db.clone());
-                        let drive = DriveClient::new(auth, pair.account_id.clone());
+                        let drive = HttpDriveClient::new(auth, pair.account_id.clone());
                         let engine = SyncEngine::new(db.clone(), pair.clone());
 
                         match engine.sync(&drive).await {

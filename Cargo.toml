@@ -57,5 +57,8 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # Directories
 dirs = "6"
 
+# Async traits
+async-trait = "0.1"
+
 # Internal
 insyncbee-core = { path = "crates/insyncbee-core" }

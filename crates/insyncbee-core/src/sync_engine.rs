@@ -69,7 +69,7 @@ impl SyncEngine {
     }
 
     /// Perform a full sync cycle: scan local, fetch remote, compare, execute actions.
-    pub async fn sync(&self, drive: &DriveClient) -> anyhow::Result<SyncReport> {
+    pub async fn sync(&self, drive: &dyn DriveClient) -> anyhow::Result<SyncReport> {
         let mut report = SyncReport::default();
 
         tracing::info!("Starting sync for pair '{}' ({})", self.pair.name, self.pair.mode);
@@ -384,7 +384,7 @@ impl SyncEngine {
     async fn execute_action(
         &self,
         action: &SyncAction,
-        drive: &DriveClient,
+        drive: &dyn DriveClient,
         _local_root: &Path,
     ) -> anyhow::Result<()> {
         match action {
@@ -486,7 +486,7 @@ impl SyncEngine {
         relative_path: &str,
         local_path: &Path,
         remote_id: &str,
-        drive: &DriveClient,
+        drive: &dyn DriveClient,
     ) -> anyhow::Result<()> {
         match self.pair.conflict_policy {
             ConflictPolicy::KeepBoth => {
@@ -569,7 +569,7 @@ impl SyncEngine {
     }
 
     /// Perform a dry run: compute actions without executing them.
-    pub async fn dry_run(&self, drive: &DriveClient) -> anyhow::Result<(Vec<SyncAction>, SyncReport)> {
+    pub async fn dry_run(&self, drive: &dyn DriveClient) -> anyhow::Result<(Vec<SyncAction>, SyncReport)> {
         tracing::info!("Dry run for pair '{}' ({})", self.pair.name, self.pair.mode);
 
         let local_root = PathBuf::from(&self.pair.local_root);
@@ -613,7 +613,7 @@ impl SyncEngine {
     /// Recursively fetch the remote file tree.
     fn fetch_remote_tree<'a>(
         &'a self,
-        drive: &'a DriveClient,
+        drive: &'a dyn DriveClient,
         folder_id: &'a str,
         prefix: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<(String, DriveFile)>>> + Send + 'a>> {

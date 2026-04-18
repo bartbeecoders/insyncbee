@@ -27,3 +27,9 @@ url = "2"
 open = "5"
 tokio-util = { version = "0.7", features = ["io"] }
 mime_guess = "2"
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+proptest = "1"

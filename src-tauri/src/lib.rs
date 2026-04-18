@@ -4,7 +4,7 @@ use insyncbee_core::db::models::{
     SyncPairStatus,
 };
 use insyncbee_core::db::Database;
-use insyncbee_core::drive::DriveClient;
+use insyncbee_core::drive::HttpDriveClient;
 use insyncbee_core::sync_engine::SyncEngine;
 use insyncbee_core::AppPaths;
 use serde::Serialize;
@@ -139,7 +139,7 @@ async fn resolve_conflict(
     let local_path = std::path::PathBuf::from(&pair.local_root).join(&relative_path);
 
     let auth = AuthManager::new(creds, db.clone());
-    let drive = DriveClient::new(auth, pair.account_id.clone());
+    let drive = HttpDriveClient::new(auth, pair.account_id.clone());
 
     match resolution.as_str() {
         "keep-local" => {
@@ -246,7 +246,7 @@ async fn trigger_sync(state: State<'_, DbState>, sync_pair_id: String) -> Result
         .ok_or_else(|| format!("Sync pair not found: {sync_pair_id}"))?;
 
     let auth = AuthManager::new(creds, db.clone());
-    let drive = DriveClient::new(auth, pair.account_id.clone());
+    let drive = HttpDriveClient::new(auth, pair.account_id.clone());
     let engine = SyncEngine::new(db, pair);
 
     let report = engine.sync(&drive).await.map_err(|e| e.to_string())?;
@@ -355,7 +355,7 @@ async fn list_drive_folders(
     };
 
     let auth = AuthManager::new(creds, db);
-    let drive = DriveClient::new(auth, account_id);
+    let drive = HttpDriveClient::new(auth, account_id);
     let parent = parent_id.as_deref().unwrap_or("root");
 
     let files = drive

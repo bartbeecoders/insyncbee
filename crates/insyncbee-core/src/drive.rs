@@ -1,5 +1,11 @@
 //! Google Drive v3 REST API client.
+//!
+//! The [`DriveClient`] trait is the seam the sync engine speaks to. The real
+//! implementation that talks to Google over HTTPS is [`HttpDriveClient`];
+//! tests provide their own in-memory `FakeDriveClient` (see
+//! `crates/insyncbee-core/tests/common/mod.rs`).
 
+use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -10,14 +16,48 @@ use crate::auth::AuthManager;
 const DRIVE_API: &str = "https://www.googleapis.com/drive/v3";
 const UPLOAD_API: &str = "https://www.googleapis.com/upload/drive/v3";
 
-/// A client for the Google Drive v3 API.
-pub struct DriveClient {
+/// The subset of Google Drive operations the sync engine depends on.
+///
+/// Implementations must be `Send + Sync` so the engine can drive them from
+/// any tokio task. Real callers use [`HttpDriveClient`]; tests use their own
+/// in-memory fake.
+#[async_trait]
+pub trait DriveClient: Send + Sync {
+    /// List every file/folder directly inside `folder_id` (handles pagination).
+    async fn list_all_files(&self, folder_id: &str) -> anyhow::Result<Vec<DriveFile>>;
+
+    /// Fetch metadata for a single file by ID.
+    async fn get_file(&self, file_id: &str) -> anyhow::Result<DriveFile>;
+
+    /// Stream the contents of `file_id` to `dest`.
+    async fn download_file(&self, file_id: &str, dest: &Path) -> anyhow::Result<()>;
+
+    /// Upload `local_path` as a new child of `parent_id`, named `name`.
+    async fn upload_file(
+        &self,
+        parent_id: &str,
+        name: &str,
+        local_path: &Path,
+    ) -> anyhow::Result<DriveFile>;
+
+    /// Replace the contents of `file_id` with `local_path`.
+    async fn update_file(&self, file_id: &str, local_path: &Path) -> anyhow::Result<DriveFile>;
+
+    /// Create an empty folder named `name` under `parent_id`.
+    async fn create_folder(&self, parent_id: &str, name: &str) -> anyhow::Result<DriveFile>;
+
+    /// Trash (soft-delete) `file_id`.
+    async fn trash_file(&self, file_id: &str) -> anyhow::Result<()>;
+}
+
+/// HTTPS-backed implementation of [`DriveClient`] that talks to Google Drive v3.
+pub struct HttpDriveClient {
     http: reqwest::Client,
     auth: AuthManager,
     account_id: String,
 }
 
-impl DriveClient {
+impl HttpDriveClient {
     pub fn new(auth: AuthManager, account_id: String) -> Self {
         Self {
             http: reqwest::Client::new(),
@@ -286,6 +326,47 @@ impl DriveClient {
             .error_for_status()?;
         let about: AboutResponse = resp.json().await?;
         Ok(about)
+    }
+}
+
+// ── DriveClient impl for HttpDriveClient ─────────────────────────────
+// Delegates to the inherent methods above. Rust prefers inherent methods
+// over trait methods at call sites, so `self.list_all_files(...)` inside
+// these bodies resolves to the inherent impl (no recursion).
+
+#[async_trait]
+impl DriveClient for HttpDriveClient {
+    async fn list_all_files(&self, folder_id: &str) -> anyhow::Result<Vec<DriveFile>> {
+        HttpDriveClient::list_all_files(self, folder_id).await
+    }
+
+    async fn get_file(&self, file_id: &str) -> anyhow::Result<DriveFile> {
+        HttpDriveClient::get_file(self, file_id).await
+    }
+
+    async fn download_file(&self, file_id: &str, dest: &Path) -> anyhow::Result<()> {
+        HttpDriveClient::download_file(self, file_id, dest).await
+    }
+
+    async fn upload_file(
+        &self,
+        parent_id: &str,
+        name: &str,
+        local_path: &Path,
+    ) -> anyhow::Result<DriveFile> {
+        HttpDriveClient::upload_file(self, parent_id, name, local_path).await
+    }
+
+    async fn update_file(&self, file_id: &str, local_path: &Path) -> anyhow::Result<DriveFile> {
+        HttpDriveClient::update_file(self, file_id, local_path).await
+    }
+
+    async fn create_folder(&self, parent_id: &str, name: &str) -> anyhow::Result<DriveFile> {
+        HttpDriveClient::create_folder(self, parent_id, name).await
+    }
+
+    async fn trash_file(&self, file_id: &str) -> anyhow::Result<()> {
+        HttpDriveClient::trash_file(self, file_id).await
     }
 }
 
