@@ -3,6 +3,7 @@ import {
   DEFAULT_RELEASES,
   detectOs,
   downloadUrl,
+  githubReleaseUrl,
   type OsKey,
   type PlatformRelease,
 } from "../data/releases";
@@ -98,10 +99,7 @@ export default function Download() {
         <p className="download-footnote">
           Each archive ships with a <code>.sha256</code> checksum next to it on
           the{" "}
-          <a
-            className="text-accent"
-            href={`https://github.com/${DEFAULT_RELEASES.repo}/releases/tag/v${DEFAULT_RELEASES.version}`}
-          >
+          <a className="text-accent" href={githubReleaseUrl()}>
             v{DEFAULT_RELEASES.version} GitHub Release
           </a>
           . All builds are produced by GitHub Actions from{" "}

@@ -93,16 +93,18 @@ export function detectOs(): OsKey | null {
   return null;
 }
 
-export function downloadUrl(
-  filename: string,
-  release: Releases = DEFAULT_RELEASES,
-): string {
-  return `https://github.com/${release.repo}/releases/download/v${release.version}/${filename}`;
+// Binaries are served by the portal pod from a hostPath volume populated by
+// the release pipeline (scp into /srv/insyncbee/releases on the VPS). The
+// nginx config maps /releases/* to that mount.
+export function downloadUrl(filename: string): string {
+  return `/releases/${filename}`;
 }
 
-export function checksumUrl(
-  filename: string,
-  release: Releases = DEFAULT_RELEASES,
-): string {
-  return `${downloadUrl(filename, release)}.sha256`;
+export function checksumUrl(filename: string): string {
+  return `${downloadUrl(filename)}.sha256`;
+}
+
+// Direct GitHub Release URL — used by the "view on GitHub" footnote.
+export function githubReleaseUrl(release: Releases = DEFAULT_RELEASES): string {
+  return `https://github.com/${release.repo}/releases/tag/v${release.version}`;
 }

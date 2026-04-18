@@ -21,10 +21,12 @@ spec:
       labels:
         app: insyncbee-portal
     spec:
+      imagePullSecrets:
+        - name: acr-secret
       containers:
         - name: portal
-          image: ghcr.io/bartbeecoders/insyncbee-portal:0.1.0
-          imagePullPolicy: IfNotPresent
+          image: beecodersregistry.azurecr.io/insyncbee-portal:latest
+          imagePullPolicy: Always
           ports:
             - name: http
               containerPort: 80

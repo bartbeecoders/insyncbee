@@ -1,0 +1,274 @@
+name: Build & Deploy Release
+
+# Tag-driven release pipeline modelled on sqail's pipeline (same VPS, same
+# k3s cluster, same secrets). On every v* tag we:
+#   1. Build the insyncbee-db-service binary for Linux, macOS and Windows
+#   2. Publish the archives + checksums to the matching GitHub Release
+#   3. Build & push the portal image to ACR
+#   4. Upload the binaries to the VPS hostPath that the portal pod serves
+#   5. Roll the portal deployment so it picks up the new image and binaries
+#
+# Required repository secrets (already configured for sqail on this VPS):
+#   ACR_USERNAME, ACR_PASSWORD       — Azure Container Registry credentials
+#   VPS_HOST, VPS_USER, VPS_SSH_KEY  — SSH access to the k3s VPS (NOPASSWD sudo)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      deploy_portal:
+        description: "Also rebuild and deploy the portal"
+        type: boolean
+        default: true
+
+env:
+  REGISTRY: beecodersregistry.azurecr.io
+  IMAGE_NAME: insyncbee-portal
+  ARCHIVE_BASENAME: insyncbee-db-service
+  VPS_RELEASES_DIR: /srv/insyncbee/releases
+
+jobs:
+  # ── Prepare: extract version ────────────────────────────────────────────
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      app_version: ${{ steps.meta.outputs.app_version }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract version
+        id: meta
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            APP_VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            APP_VERSION=$(grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' insyncbee.portal/package.json | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
+          fi
+          echo "app_version=${APP_VERSION}"  >> "$GITHUB_OUTPUT"
+          echo "tag=v${APP_VERSION}"         >> "$GITHUB_OUTPUT"
+          echo "Version: ${APP_VERSION}"
+
+  # ── Build db-service for each platform ──────────────────────────────────
+  build-db-service:
+    needs: prepare
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - label: macos-aarch64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - label: macos-x86_64
+            runner: macos-13
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - label: windows-x86_64
+            runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            archive: zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build daemon
+        shell: bash
+        run: cargo build --release --locked -p insyncbee-daemon --target ${{ matrix.target }}
+
+      - name: Stage binary
+        id: stage
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.app_version }}
+        run: |
+          set -euo pipefail
+          STAGE="stage/${ARCHIVE_BASENAME}-${VERSION}-${{ matrix.label }}"
+          mkdir -p "$STAGE"
+          if [[ "${{ matrix.runner }}" == windows-* ]]; then
+            cp "target/${{ matrix.target }}/release/insyncbee.exe" "$STAGE/"
+          else
+            cp "target/${{ matrix.target }}/release/insyncbee" "$STAGE/"
+          fi
+          cat > "$STAGE/README.txt" <<EOF
+          InSyncBee db-service ${VERSION} (${{ matrix.label }})
+
+          The 'insyncbee' binary is the headless background sync service.
+          Run 'insyncbee --help' for usage.
+          EOF
+          echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Archive (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.app_version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/releases
+          ARCHIVE="dist/releases/${ARCHIVE_BASENAME}-${VERSION}-${{ matrix.label }}.tar.gz"
+          tar -C "${{ steps.stage.outputs.stage }}" -czf "$ARCHIVE" .
+          shasum -a 256 "$ARCHIVE" | sed "s# .*/# #" > "$ARCHIVE.sha256"
+          ls -lh dist/releases/
+
+      - name: Archive (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.prepare.outputs.app_version }}
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/releases | Out-Null
+          $archive = "dist/releases/$env:ARCHIVE_BASENAME-$env:VERSION-${{ matrix.label }}.zip"
+          Compress-Archive -Path "${{ steps.stage.outputs.stage }}/*" -DestinationPath $archive -Force
+          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLower()
+          $base = Split-Path -Leaf $archive
+          "$hash  $base" | Out-File -Encoding ascii "$archive.sha256"
+          Get-ChildItem dist/releases
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: db-service-${{ matrix.label }}
+          path: dist/releases/insyncbee-db-service-*
+          if-no-files-found: error
+          retention-days: 30
+
+  # ── Create / update GitHub Release ──────────────────────────────────────
+  github-release:
+    needs: [prepare, build-db-service]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh artifacts/
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.prepare.outputs.tag }}"
+          FILES=()
+          for f in artifacts/insyncbee-db-service-*; do
+            [ -f "$f" ] && FILES+=("$f")
+          done
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${FILES[@]}" --clobber
+          else
+            gh release create "$TAG" "${FILES[@]}" \
+              --title "$TAG" \
+              --notes "InSyncBee db-service ${{ needs.prepare.outputs.app_version }}"
+          fi
+
+  # ── Upload binaries to VPS so the portal pod can serve them ─────────────
+  deploy-binaries:
+    needs: [prepare, build-db-service]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lhR artifacts/
+
+      # NOTE: ${{ env.VPS_RELEASES_DIR }} (/srv/insyncbee/releases) must already
+      # exist on the VPS and be owned by the SSH user. Run ONCE on the VPS:
+      #   sudo mkdir -p /srv/insyncbee/releases
+      #   sudo chown -R $USER:$USER /srv/insyncbee
+      - name: Upload to VPS
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          source: "artifacts/*"
+          target: ${{ env.VPS_RELEASES_DIR }}
+          strip_components: 1
+
+      - name: Generate manifest on VPS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            cd ${{ env.VPS_RELEASES_DIR }}
+            FILES=$(ls -1 insyncbee-db-service-* 2>/dev/null | jq -R -s 'split("\n") | map(select(length > 0))')
+            cat > manifest.json <<EOF
+            {
+              "version": "${{ needs.prepare.outputs.app_version }}",
+              "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+              "files": $FILES
+            }
+            EOF
+            echo "Manifest:"
+            cat manifest.json
+
+  # ── Rebuild & deploy portal so download links + releases.json refresh ──
+  deploy-portal:
+    needs: [prepare, deploy-binaries]
+    if: ${{ github.event_name == 'push' || inputs.deploy_portal }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stage releases.json into portal build context
+        run: cp releases.json insyncbee.portal/releases.json
+
+      - name: Login to ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build and push portal image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./insyncbee.portal
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.app_version }}
+
+      - name: Deploy to K3S
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            if command -v kubectl >/dev/null 2>&1; then
+              KUBECTL="kubectl"
+            else
+              KUBECTL="sudo k3s kubectl"
+            fi
+            $KUBECTL -n insyncbee rollout restart deployment insyncbee-portal
+            $KUBECTL -n insyncbee rollout status deployment insyncbee-portal --timeout=120s

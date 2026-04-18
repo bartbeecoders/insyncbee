@@ -84,11 +84,16 @@ push_image() {
 deploy_manifests() {
   echo "Deploying to $VPS_USER@$VPS_IP (namespace: $NAMESPACE)..."
 
-  # Ensure working directory on VPS
-  ssh_vps "mkdir -p $VPS_K8S_DIR || (command -v sudo >/dev/null 2>&1 && sudo mkdir -p $VPS_K8S_DIR && sudo chown -R $VPS_USER:$VPS_USER $VPS_BASE_DIR)"
+  # Ensure working directory on VPS (no sudo over non-TTY ssh — fall back only if needed)
+  ssh_vps "mkdir -p $VPS_K8S_DIR"
 
-  # Ensure releases dir exists on the node (hostPath mount target)
-  ssh_vps "sudo mkdir -p /srv/insyncbee/releases && sudo chmod 0755 /srv/insyncbee/releases"
+  # The hostPath releases dir (/srv/insyncbee/releases) is created by the
+  # kubelet via DirectoryOrCreate the first time the pod starts. If you want
+  # the CI pipeline / scp to write there as $VPS_USER, run ONCE on the VPS:
+  #   sudo mkdir -p /srv/insyncbee/releases
+  #   sudo chown -R $USER:$USER /srv/insyncbee
+  # We don't do that here because non-TTY ssh has no way to enter a sudo
+  # password.
 
   # Copy manifests
   scp -o StrictHostKeyChecking=accept-new -r "$ROOT_DIR/k8s/portal" "$VPS_USER@$VPS_IP:$VPS_K8S_DIR/"
