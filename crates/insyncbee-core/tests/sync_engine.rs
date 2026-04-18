@@ -279,6 +279,50 @@ async fn deeply_nested_new_local_dirs_resolve_each_other_as_parents() {
 }
 
 #[tokio::test]
+async fn files_added_to_existing_synced_folder_get_uploaded() {
+    // Reproduces the user-reported scenario:
+    //   1. Create a folder locally → sync (folder lands on remote).
+    //   2. Add files to that folder locally.
+    //   3. Sync again → those files must upload into the existing folder.
+    let fx = SyncFixture::new(SyncMode::TwoWay);
+    std::fs::create_dir(fx.local_path().join("myfolder")).unwrap();
+
+    let engine = SyncEngine::new(fx.db.clone(), fx.pair.clone());
+    engine.sync(&fx.fake).await.unwrap();
+    let folder_id = fx
+        .fake
+        .snapshot_by_name()
+        .get("myfolder")
+        .expect("folder must exist on remote after first sync")
+        .meta
+        .id
+        .clone();
+
+    // Step 2: drop in four files locally.
+    for n in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+        fx.write_local(&format!("myfolder/{n}"), &format!("contents of {n}"));
+    }
+
+    // Step 3: re-sync.
+    let report = engine.sync(&fx.fake).await.unwrap();
+    assert_eq!(report.errors, 0, "no errors expected");
+    assert_eq!(report.uploaded, 4, "all four files should upload");
+
+    // Each file should sit inside `myfolder`, not at the sync root.
+    let snap = fx.fake.snapshot_by_name();
+    for n in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+        let f = snap
+            .get(n)
+            .unwrap_or_else(|| panic!("{n} should now exist on remote"));
+        let parents = f.meta.parents.clone().unwrap_or_default();
+        assert!(
+            parents.contains(&folder_id),
+            "{n} should be inside myfolder ({folder_id}), got parents={parents:?}",
+        );
+    }
+}
+
+#[tokio::test]
 async fn second_sync_after_new_nested_upload_is_a_noop() {
     // After the first sync correctly nests everything, the second sync
     // should see no changes anywhere — exercises that update_index recorded
