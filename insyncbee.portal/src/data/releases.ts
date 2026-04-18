@@ -1,12 +1,14 @@
 export type OsKey = "linux" | "mac" | "windows";
 
+// `osLabel` is the segment that appears in archive filenames produced by the
+// release pipeline (e.g. "linux-x86_64", "macos-aarch64", "windows-x86_64").
 export interface Artifact {
-  kind: string;        // e.g. "tar.gz", "zip"
-  label: string;       // human-readable label shown on the card
-  arch: string;        // e.g. "x86_64", "aarch64"
-  filename: string;    // matches the GitHub Release asset filename
-  size?: string;       // e.g. "9.2 MB"
-  sha256?: string;     // optional
+  kind: "tar.gz" | "zip"; // archive extension
+  label: string;          // human-readable label shown on the card
+  arch: string;           // e.g. "x86_64", "aarch64"
+  osLabel: string;        // matrix label produced by .github/workflows/release.yml
+  size?: string;
+  sha256?: string;
 }
 
 export interface PlatformRelease {
@@ -17,17 +19,17 @@ export interface PlatformRelease {
 }
 
 export interface Releases {
-  version: string;
+  version: string;     // sed-replaced by CI (deploy-portal step)
   channel: "stable" | "beta" | "dev";
-  releasedAt: string; // ISO
-  product: string;    // e.g. "insyncbee-db-service"
-  repo: string;       // "<owner>/<name>" — drives the GitHub release URL
+  releasedAt: string;  // sed-replaced by CI (deploy-portal step)
+  product: string;
+  repo: string;
   platforms: PlatformRelease[];
 }
 
-// Default baked-in manifest. The Docker build copies the top-level
-// `releases.json` over this on `deploy-portal.yml` so the portal always
-// reflects the latest published GitHub Release.
+// Single source of truth. CI rewrites only `version` and `releasedAt` before
+// the portal Docker build — every filename is derived from `version` so a
+// tag bump propagates everywhere automatically.
 export const DEFAULT_RELEASES: Releases = {
   version: "0.1.0",
   channel: "dev",
@@ -40,25 +42,15 @@ export const DEFAULT_RELEASES: Releases = {
       displayName: "Linux",
       requirement: "glibc 2.35+ (Ubuntu 22.04+, Fedora 38+, Arch)",
       artifacts: [
-        {
-          kind: "tar.gz",
-          label: "Linux x86_64 (tar.gz)",
-          arch: "x86_64",
-          filename: "insyncbee-db-service-0.1.0-linux-x86_64.tar.gz",
-        },
+        { kind: "tar.gz", label: "Linux x86_64 (tar.gz)", arch: "x86_64", osLabel: "linux-x86_64" },
       ],
     },
     {
       os: "mac",
       displayName: "macOS",
-      requirement: "macOS 12 Monterey or later",
+      requirement: "macOS 12 Monterey or later (Apple Silicon)",
       artifacts: [
-        {
-          kind: "tar.gz",
-          label: "Apple Silicon (tar.gz)",
-          arch: "aarch64",
-          filename: "insyncbee-db-service-0.1.0-macos-aarch64.tar.gz",
-        },
+        { kind: "tar.gz", label: "Apple Silicon (tar.gz)", arch: "aarch64", osLabel: "macos-aarch64" },
       ],
     },
     {
@@ -66,16 +58,18 @@ export const DEFAULT_RELEASES: Releases = {
       displayName: "Windows",
       requirement: "Windows 10 1809 or later",
       artifacts: [
-        {
-          kind: "zip",
-          label: "Windows x86_64 (zip)",
-          arch: "x86_64",
-          filename: "insyncbee-db-service-0.1.0-windows-x86_64.zip",
-        },
+        { kind: "zip", label: "Windows x86_64 (zip)", arch: "x86_64", osLabel: "windows-x86_64" },
       ],
     },
   ],
 };
+
+export function artifactFilename(
+  artifact: Artifact,
+  release: Releases = DEFAULT_RELEASES,
+): string {
+  return `${release.product}-${release.version}-${artifact.osLabel}.${artifact.kind}`;
+}
 
 export function detectOs(): OsKey | null {
   if (typeof navigator === "undefined") return null;
@@ -90,15 +84,20 @@ export function detectOs(): OsKey | null {
 // Binaries are served by the portal pod from a hostPath volume populated by
 // the release pipeline (scp into /srv/insyncbee/releases on the VPS). The
 // nginx config maps /releases/* to that mount.
-export function downloadUrl(filename: string): string {
-  return `/releases/${filename}`;
+export function downloadUrl(
+  artifact: Artifact,
+  release: Releases = DEFAULT_RELEASES,
+): string {
+  return `/releases/${artifactFilename(artifact, release)}`;
 }
 
-export function checksumUrl(filename: string): string {
-  return `${downloadUrl(filename)}.sha256`;
+export function checksumUrl(
+  artifact: Artifact,
+  release: Releases = DEFAULT_RELEASES,
+): string {
+  return `${downloadUrl(artifact, release)}.sha256`;
 }
 
-// Direct GitHub Release URL — used by the "view on GitHub" footnote.
 export function githubReleaseUrl(release: Releases = DEFAULT_RELEASES): string {
   return `https://github.com/${release.repo}/releases/tag/v${release.version}`;
 }

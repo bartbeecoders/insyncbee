@@ -38,8 +38,8 @@ function PlatformCard({ platform }: { platform: PlatformRelease }) {
         <div className="artifact-list">
           {platform.artifacts.map((a) => (
             <a
-              key={a.filename}
-              href={downloadUrl(a.filename)}
+              key={a.osLabel}
+              href={downloadUrl(a)}
               download
             >
               {a.label} <code>{a.arch}</code>
@@ -82,7 +82,7 @@ export default function Download() {
             </div>
             <a
               className="btn btn-primary btn-lg"
-              href={downloadUrl(topArtifact.filename)}
+              href={downloadUrl(topArtifact)}
               download
             >
               ↓ Download {DEFAULT_RELEASES.version}

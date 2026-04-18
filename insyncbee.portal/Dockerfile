@@ -17,7 +17,9 @@ RUN if [ -f pnpm-lock.yaml ]; then \
 
 COPY . .
 
-# releases.json is copied into the build context by deploy-k3s.sh before build
+# Version + releasedAt are sed'd into src/data/releases.ts by the
+# deploy-portal job before this build runs, so the bundled SPA matches the
+# tag being released.
 RUN npm run build
 
 # ── Runtime stage ────────────────────────────────────────────────

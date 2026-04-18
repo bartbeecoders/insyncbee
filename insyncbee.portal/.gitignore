@@ -5,5 +5,3 @@ dist-ts
 *.log
 .env*
 .DS_Store
-# releases.json is copied in at deploy time from the repo root
-releases.json

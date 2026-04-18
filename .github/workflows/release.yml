@@ -238,8 +238,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Stage releases.json into portal build context
-        run: cp releases.json insyncbee.portal/releases.json
+      - name: Pin version + releasedAt in releases.ts
+        env:
+          VERSION: ${{ needs.prepare.outputs.app_version }}
+        run: |
+          set -euo pipefail
+          RELEASED_AT=$(date -u +%Y-%m-%d)
+          F=insyncbee.portal/src/data/releases.ts
+          sed -i "s/version: \"[^\"]*\"/version: \"${VERSION}\"/"          "$F"
+          sed -i "s/releasedAt: \"[^\"]*\"/releasedAt: \"${RELEASED_AT}\"/" "$F"
+          echo "After sed:"
+          grep -E "version:|releasedAt:" "$F"
 
       - name: Login to ACR
         uses: docker/login-action@v3

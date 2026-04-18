@@ -183,7 +183,7 @@ impl SyncEngine {
                         if self.pair.mode != SyncMode::CloudToLocal {
                             SyncAction::CreateRemoteDir {
                                 relative_path: path.clone(),
-                                remote_parent_id: self.pair.remote_root_id.clone(),
+                                remote_parent_id: self.resolve_remote_parent_id(path, remote).to_string(),
                                 name: Path::new(path)
                                     .file_name()
                                     .unwrap_or_default()
@@ -200,7 +200,7 @@ impl SyncEngine {
                         SyncAction::Upload {
                             relative_path: path.clone(),
                             local_path: local_root.join(path),
-                            remote_parent_id: self.pair.remote_root_id.clone(),
+                            remote_parent_id: self.resolve_remote_parent_id(path, remote).to_string(),
                         }
                     } else {
                         SyncAction::Skip {
@@ -685,6 +685,25 @@ impl SyncEngine {
         })?;
 
         Ok(())
+    }
+
+    /// Resolve the remote ID of the parent folder for a given relative path.
+    /// Falls back to the sync pair's remote root ID for top-level entries.
+    fn resolve_remote_parent_id<'a>(
+        &'a self,
+        relative_path: &str,
+        remote: &'a HashMap<String, DriveFile>,
+    ) -> &'a str {
+        match Path::new(relative_path).parent() {
+            Some(parent) if parent != Path::new("") => {
+                let parent_str = parent.to_string_lossy();
+                if let Some(parent_file) = remote.get(parent_str.as_ref()) {
+                    return &parent_file.id;
+                }
+                &self.pair.remote_root_id
+            }
+            _ => &self.pair.remote_root_id,
+        }
     }
 
     fn log_change(&self, path: &str, action: &str, detail: Option<&str>) {
