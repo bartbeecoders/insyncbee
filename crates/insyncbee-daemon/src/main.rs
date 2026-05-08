@@ -3,11 +3,31 @@ use insyncbee_core::auth::{AuthManager, OAuthCredentials};
 use insyncbee_core::db::models::{ConflictPolicy, SyncMode, SyncPair, SyncPairStatus};
 use insyncbee_core::db::Database;
 use insyncbee_core::drive::HttpDriveClient;
+use insyncbee_core::keystore;
 use insyncbee_core::sync_engine::{SyncAction, SyncEngine};
 use insyncbee_core::watcher::FileWatcher;
 use insyncbee_core::AppPaths;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+
+/// Build a sync engine for `pair`. If the pair is encrypted, the cipher
+/// is loaded from the OS keyring and attached. Returns an error when the
+/// keyring entry is missing — the caller surfaces that as a "needs unlock"
+/// hint rather than silently skipping the pair.
+fn build_engine(db: &Database, pair: &SyncPair) -> anyhow::Result<SyncEngine> {
+    let mut engine = SyncEngine::new(db.clone(), pair.clone());
+    if pair.encryption_enabled {
+        let cipher = keystore::load_cipher(&pair.id)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "encryption key for '{}' is not in the keyring — run the GUI and unlock it once",
+                pair.name
+            )
+        })?;
+        engine = engine.with_cipher(Arc::new(cipher));
+    }
+    Ok(engine)
+}
 
 #[derive(Parser)]
 #[command(
@@ -101,15 +121,31 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+    let cli = Cli::parse();
+    let paths = AppPaths::new()?;
+
+    // Log to stdout AND to a daily-rotating file under paths.log_dir.
+    // The non-blocking guard must outlive the program — keep it on the stack.
+    let file_appender = tracing_appender::rolling::daily(&paths.log_dir, "insyncbee.log");
+    let (file_writer, _guard) = tracing_appender::non_blocking(file_appender);
+
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(file_writer)
+                .with_ansi(false),
         )
         .init();
 
-    let cli = Cli::parse();
-    let paths = AppPaths::new()?;
+    tracing::info!("Logs: {}/insyncbee.log.<date>", paths.log_dir.display());
+
     let db = Database::open(&paths.db_path)?;
 
     match cli.command {
@@ -175,6 +211,11 @@ async fn main() -> anyhow::Result<()> {
                 poll_interval_secs: 30,
                 created_at: chrono::Utc::now().to_rfc3339(),
                 updated_at: chrono::Utc::now().to_rfc3339(),
+                // The CLI doesn't (yet) take a passphrase. Use the GUI to
+                // create encrypted pairs.
+                encryption_enabled: false,
+                encryption_salt: None,
+                encryption_verifier: None,
             };
 
             db.with_conn(|conn| pair.insert(conn))?;
@@ -248,7 +289,13 @@ async fn main() -> anyhow::Result<()> {
 
                 let auth = AuthManager::new(creds.clone(), db.clone());
                 let drive = HttpDriveClient::new(auth, p.account_id.clone());
-                let engine = SyncEngine::new(db.clone(), p.clone());
+                let engine = match build_engine(&db, &p) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        eprintln!("  Skipping '{}': {e}", p.name);
+                        continue;
+                    }
+                };
 
                 if dry_run {
                     println!("Dry run for '{}':", p.name);
@@ -369,7 +416,13 @@ async fn run_daemon(db: Database) -> anyhow::Result<()> {
     for pair in &active_pairs {
         let auth = AuthManager::new(creds.clone(), db.clone());
         let drive = HttpDriveClient::new(auth, pair.account_id.clone());
-        let engine = SyncEngine::new(db.clone(), pair.clone());
+        let engine = match build_engine(&db, pair) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!("Skipping initial sync for '{}': {e}", pair.name);
+                continue;
+            }
+        };
 
         tracing::info!("Initial sync for '{}'...", pair.name);
         match engine.sync(&drive).await {
@@ -405,7 +458,13 @@ async fn run_daemon(db: Database) -> anyhow::Result<()> {
 
                         let auth = AuthManager::new(creds.clone(), db.clone());
                         let drive = HttpDriveClient::new(auth, pair.account_id.clone());
-                        let engine = SyncEngine::new(db.clone(), pair.clone());
+                        let engine = match build_engine(&db, pair) {
+                            Ok(e) => e,
+                            Err(e) => {
+                                tracing::warn!("Skipping poll for '{}': {e}", pair.name);
+                                continue;
+                            }
+                        };
 
                         tracing::debug!("Polling remote changes for '{}'...", pair.name);
                         match engine.sync(&drive).await {
@@ -431,7 +490,13 @@ async fn run_daemon(db: Database) -> anyhow::Result<()> {
                     if let Some(pair) = active_pairs.iter().find(|p| p.id == *pair_id) {
                         let auth = AuthManager::new(creds.clone(), db.clone());
                         let drive = HttpDriveClient::new(auth, pair.account_id.clone());
-                        let engine = SyncEngine::new(db.clone(), pair.clone());
+                        let engine = match build_engine(&db, pair) {
+                            Ok(e) => e,
+                            Err(e) => {
+                                tracing::warn!("Skipping watcher-triggered sync for '{}': {e}", pair.name);
+                                continue;
+                            }
+                        };
 
                         match engine.sync(&drive).await {
                             Ok(report) => {

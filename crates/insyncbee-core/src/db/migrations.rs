@@ -18,7 +18,7 @@ pub fn run_all(conn: &Connection) -> Result<()> {
         )
         .unwrap_or(0);
 
-    let migrations: &[(&str, i64)] = &[(MIGRATION_001, 1)];
+    let migrations: &[(&str, i64)] = &[(MIGRATION_001, 1), (MIGRATION_002, 2)];
 
     for (sql, version) in migrations {
         if *version > current {
@@ -101,4 +101,19 @@ CREATE TABLE IF NOT EXISTS change_log (
 
 CREATE INDEX IF NOT EXISTS idx_change_log_pair ON change_log(sync_pair_id);
 CREATE INDEX IF NOT EXISTS idx_change_log_time ON change_log(created_at);
+";
+
+// ── v2: per-sync-pair encryption ────────────────────────────────────
+// Adds three columns to `sync_pairs`. When `encryption_enabled = 1`:
+//   - `encryption_salt` is the 16-byte Argon2id salt for the user's
+//     passphrase (also used to re-derive the key on a different machine).
+//   - `encryption_verifier` is a small AEAD blob we can decrypt with the
+//     derived key to confirm the user typed the right passphrase before
+//     starting a sync (see crypto::FileCipher::make_verifier).
+// The actual 32-byte derived key is **not** stored here — it lives in
+// the OS keyring (see crate::keystore).
+const MIGRATION_002: &str = "
+ALTER TABLE sync_pairs ADD COLUMN encryption_enabled INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE sync_pairs ADD COLUMN encryption_salt BLOB;
+ALTER TABLE sync_pairs ADD COLUMN encryption_verifier BLOB;
 ";

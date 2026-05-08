@@ -221,6 +221,12 @@ body {
   font-weight: 500;
 }
 
+.badge-encryption {
+  background: rgba(80, 160, 255, 0.15);
+  color: #4a90e2;
+  border: 1px solid rgba(80, 160, 255, 0.4);
+}
+
 /* ── Paths ───────────────────────────────────────────────────── */
 
 .path-row {
@@ -244,6 +250,65 @@ body {
   background: var(--bg);
   padding: 2px 6px;
   border-radius: 4px;
+}
+
+/* ── Upload progress ──────────────────────────────────────────── */
+
+.upload-progress-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.upload-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.upload-progress-meta {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  font-size: 12px;
+}
+
+.upload-progress-name {
+  font-family: var(--mono);
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+
+.upload-progress-bytes {
+  color: var(--text-muted);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.upload-progress-bar {
+  height: 4px;
+  background: var(--bg);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.upload-progress-fill {
+  height: 100%;
+  background: var(--accent, #4a9eff);
+  transition: width 150ms linear;
+}
+
+.upload-progress-stats {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
 }
 
 /* ── Buttons ─────────────────────────────────────────────────── */

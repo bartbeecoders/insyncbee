@@ -1,6 +1,29 @@
-import { createSignal, createResource, Show, For } from "solid-js";
+import { createSignal, createResource, Show, For, onMount, onCleanup } from "solid-js";
+import { createStore, produce } from "solid-js/store";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+
+interface UploadProgress {
+  syncPairId: string;
+  name: string;
+  path: string;
+  bytes: number;
+  total: number;
+}
+
+// Augmented entry stored client-side. We snapshot the first event's
+// (time, bytes) so we can compute average speed and ETA from the deltas
+// — the backend doesn't send timing info, just current/total.
+interface UploadEntry extends UploadProgress {
+  startedAt: number;
+  startedBytes: number;
+  lastUpdatedAt: number;
+  speedBps: number | null;
+  etaSeconds: number | null;
+}
+
+type UploadsByPair = Record<string, Record<string, UploadEntry>>;
 
 interface Account {
   id: string;
@@ -19,6 +42,7 @@ interface SyncPair {
   status: string;
   conflict_policy: string;
   poll_interval_secs: number;
+  encryption_enabled: boolean;
 }
 
 interface DriveFolder {
@@ -52,6 +76,59 @@ function App() {
   const [accounts, { refetch: refetchAccounts }] = createResource(fetchAccounts);
   const [syncPairs, { refetch: refetchPairs }] = createResource(fetchSyncPairs);
   const [selectedPair, setSelectedPair] = createSignal<string | null>(null);
+
+  // Per-sync-pair, per-file upload progress map. Populated by Tauri events
+  // emitted from the resumable-upload chunk loop; cleared per pair when
+  // that pair's sync finishes (which is the natural moment to drop bars,
+  // whether the sync succeeded or errored mid-flight).
+  const [uploads, setUploads] = createStore<UploadsByPair>({});
+
+  onMount(() => {
+    const unlistenProgress = listen<UploadProgress>("upload-progress", (e) => {
+      const p = e.payload;
+      const now = Date.now();
+      setUploads(
+        produce((u) => {
+          if (!u[p.syncPairId]) u[p.syncPairId] = {};
+          const prev = u[p.syncPairId][p.path];
+          // Anchor speed/ETA calculations to the first event we see for
+          // this file. We can't use bytes=0 as a sentinel because in-flight
+          // uploads from a previous sync could resume at non-zero offsets.
+          const startedAt = prev?.startedAt ?? now;
+          const startedBytes = prev?.startedBytes ?? p.bytes;
+          const elapsedMs = now - startedAt;
+          const transferred = p.bytes - startedBytes;
+          // Average speed since start. Resilient — doesn't oscillate on a
+          // slow chunk the way a sliding-window estimate would. The
+          // tradeoff: ETA reacts slowly if the network changes mid-upload,
+          // which for personal-file sync is a non-issue.
+          const speedBps =
+            elapsedMs > 250 && transferred > 0
+              ? (transferred * 1000) / elapsedMs
+              : null;
+          const remaining = Math.max(0, p.total - p.bytes);
+          const etaSeconds =
+            speedBps && speedBps > 0 ? remaining / speedBps : null;
+          u[p.syncPairId][p.path] = {
+            ...p,
+            startedAt,
+            startedBytes,
+            lastUpdatedAt: now,
+            speedBps,
+            etaSeconds,
+          };
+        }),
+      );
+    });
+    const unlistenFinished = listen<string>("sync-finished", (e) => {
+      const pairId = e.payload;
+      setUploads(produce((u) => { delete u[pairId]; }));
+    });
+    onCleanup(() => {
+      unlistenProgress.then((u) => u());
+      unlistenFinished.then((u) => u());
+    });
+  });
 
   async function fetchAccounts(): Promise<Account[]> {
     return await invoke("list_accounts");
@@ -95,6 +172,7 @@ function App() {
           <Dashboard
             accounts={accounts() ?? []}
             syncPairs={syncPairs() ?? []}
+            uploads={uploads}
             onRefresh={() => { refetchAccounts(); refetchPairs(); }}
             onSelectPair={setSelectedPair}
           />
@@ -116,6 +194,7 @@ function App() {
 function Dashboard(props: {
   accounts: Account[];
   syncPairs: SyncPair[];
+  uploads: UploadsByPair;
   onRefresh: () => void;
   onSelectPair: (id: string | null) => void;
 }) {
@@ -125,6 +204,8 @@ function Dashboard(props: {
   const [editingPair, setEditingPair] = createSignal<SyncPair | null>(null);
   const [showForm, setShowForm] = createSignal(false);
   const [deleting, setDeleting] = createSignal<string | null>(null);
+  const [reconnecting, setReconnecting] = createSignal<string | null>(null);
+  const [unlockingPair, setUnlockingPair] = createSignal<SyncPair | null>(null);
 
   function openAddForm() {
     setEditingPair(null);
@@ -165,19 +246,48 @@ function Dashboard(props: {
     }
   }
 
-  async function handleLogout(accountId: string) {
+  async function handleLogout(acc: Account) {
+    const ok = confirm(
+      `Remove account "${acc.email}"?\n\nThis disconnects the account from InSyncBee. Files on Google Drive and on disk are NOT affected.`,
+    );
+    if (!ok) return;
     try {
-      await invoke("logout", { accountId });
+      await invoke("logout", { accountId: acc.id });
       props.onRefresh();
     } catch (e) {
-      console.error("Logout failed:", e);
+      alert(`Failed to remove account: ${e}`);
     }
   }
 
-  async function handleSync(pairId: string) {
-    setSyncing(pairId);
+  async function handleReconnect(acc: Account) {
+    setReconnecting(acc.id);
     try {
-      const report = await invoke<string>("trigger_sync", { syncPairId: pairId });
+      await invoke("reconnect_account", { accountId: acc.id });
+      props.onRefresh();
+    } catch (e) {
+      alert(`Failed to reconnect: ${e}`);
+    } finally {
+      setReconnecting(null);
+    }
+  }
+
+  async function handleSync(pair: SyncPair) {
+    // Encrypted pair? Make sure the key is in the keyring before kicking
+    // off — otherwise the daemon would error per-file. Prompt for the
+    // passphrase if needed, then proceed.
+    if (pair.encryption_enabled) {
+      const unlocked = await invoke<boolean>("encryption_unlocked", {
+        syncPairId: pair.id,
+      });
+      if (!unlocked) {
+        setUnlockingPair(pair);
+        return;
+      }
+    }
+
+    setSyncing(pair.id);
+    try {
+      const report = await invoke<string>("trigger_sync", { syncPairId: pair.id });
       console.log("Sync result:", report);
       props.onRefresh();
     } catch (e) {
@@ -215,12 +325,22 @@ function Dashboard(props: {
                 <div class="card">
                   <div class="card-header">
                     <div class="card-title">{acc.email}</div>
-                    <button
-                      class="btn btn-sm btn-ghost btn-danger"
-                      onClick={() => handleLogout(acc.id)}
-                    >
-                      Remove
-                    </button>
+                    <div class="section-actions">
+                      <button
+                        class="btn btn-sm btn-ghost"
+                        onClick={() => handleReconnect(acc)}
+                        disabled={reconnecting() === acc.id}
+                        title="Re-run Google sign-in to refresh tokens (use this if syncing fails with an auth error)"
+                      >
+                        {reconnecting() === acc.id ? "Reconnecting..." : "Reconnect"}
+                      </button>
+                      <button
+                        class="btn btn-sm btn-ghost btn-danger"
+                        onClick={() => handleLogout(acc)}
+                      >
+                        Remove
+                      </button>
+                    </div>
                   </div>
                   <div class="card-subtitle">{acc.display_name ?? "Google Account"}</div>
                 </div>
@@ -285,6 +405,13 @@ function Dashboard(props: {
                       <span class="label">Remote:</span>
                       <code>{pair.remote_root_path}</code>
                     </div>
+                    <Show when={Object.keys(props.uploads[pair.id] ?? {}).length > 0}>
+                      <div class="upload-progress-list">
+                        <For each={Object.values(props.uploads[pair.id] ?? {})}>
+                          {(up) => <UploadProgressRow upload={up} />}
+                        </For>
+                      </div>
+                    </Show>
                   </div>
                   <div class="card-footer">
                     <button
@@ -292,11 +419,19 @@ function Dashboard(props: {
                       disabled={syncing() === pair.id}
                       onClick={(e) => {
                         e.stopPropagation();
-                        handleSync(pair.id);
+                        handleSync(pair);
                       }}
                     >
                       {syncing() === pair.id ? "Syncing..." : "Sync Now"}
                     </button>
+                    <Show when={pair.encryption_enabled}>
+                      <span
+                        class="badge badge-encryption"
+                        title="Files in this pair are encrypted before upload (AES-256-GCM)"
+                      >
+                        🔒 Encrypted
+                      </span>
+                    </Show>
                     <Show when={pair.status === "active"}>
                       <button
                         class="btn btn-sm btn-ghost"
@@ -362,6 +497,102 @@ function Dashboard(props: {
           }}
         />
       </Show>
+
+      <Show when={unlockingPair()}>
+        <UnlockEncryptionModal
+          pair={unlockingPair()!}
+          onCancel={() => setUnlockingPair(null)}
+          onUnlocked={async () => {
+            const p = unlockingPair()!;
+            setUnlockingPair(null);
+            // Now that the key is in the keyring, kick off the sync.
+            await handleSync(p);
+          }}
+        />
+      </Show>
+    </div>
+  );
+}
+
+// ── Unlock Encryption Modal ──────────────────────────────────────
+//
+// Shown when the user clicks "Sync Now" on an encrypted pair whose
+// derived key is not currently in the OS keyring. Verifies the
+// passphrase server-side via the stored verifier (no key bytes ever
+// cross the wire).
+function UnlockEncryptionModal(props: {
+  pair: SyncPair;
+  onCancel: () => void;
+  onUnlocked: () => void | Promise<void>;
+}) {
+  const [passphrase, setPassphrase] = createSignal("");
+  const [submitting, setSubmitting] = createSignal(false);
+  const [error, setError] = createSignal<string | null>(null);
+
+  async function handleSubmit() {
+    if (!passphrase()) {
+      setError("Enter the passphrase.");
+      return;
+    }
+    setSubmitting(true);
+    setError(null);
+    try {
+      await invoke("unlock_encryption", {
+        syncPairId: props.pair.id,
+        passphrase: passphrase(),
+      });
+      await props.onUnlocked();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div class="modal-backdrop" onClick={props.onCancel}>
+      <div class="modal modal-sm" onClick={(e) => e.stopPropagation()}>
+        <div class="modal-header">
+          <h2>Unlock "{props.pair.name}"</h2>
+          <button class="btn btn-sm btn-ghost" onClick={props.onCancel}>
+            ✕
+          </button>
+        </div>
+        <div class="modal-body">
+          <p>
+            This sync pair is encrypted. Enter the passphrase you set when
+            you created it to unlock the key on this machine.
+          </p>
+          <Show when={error()}>
+            <p class="error-msg">{error()}</p>
+          </Show>
+          <div class="form-field">
+            <label>Passphrase</label>
+            <input
+              type="password"
+              autocomplete="current-password"
+              autofocus
+              value={passphrase()}
+              onInput={(e) => setPassphrase(e.currentTarget.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") handleSubmit();
+              }}
+            />
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-ghost" onClick={props.onCancel}>
+            Cancel
+          </button>
+          <button
+            class="btn btn-primary"
+            disabled={submitting()}
+            onClick={handleSubmit}
+          >
+            {submitting() ? "Unlocking…" : "Unlock & Sync"}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -373,6 +604,88 @@ const SYNC_MODES: { value: string; label: string }[] = [
   { value: "local-to-cloud", label: "Upload only (local → Drive)" },
   { value: "cloud-to-local", label: "Download only (Drive → local)" },
 ];
+
+function UploadProgressRow(props: { upload: UploadEntry }) {
+  // Tick once a second so the ETA visibly counts down between chunk
+  // events. On a slow link a chunk can take 30s+ and a static ETA would
+  // look frozen. Cleaned up automatically when the row unmounts (which
+  // happens when sync-finished clears its pair from the store).
+  const [now, setNow] = createSignal(Date.now());
+  const interval = setInterval(() => setNow(Date.now()), 1000);
+  onCleanup(() => clearInterval(interval));
+
+  const pct = () =>
+    props.upload.total > 0
+      ? Math.min(100, Math.round((props.upload.bytes / props.upload.total) * 100))
+      : 0;
+
+  // Subtract elapsed-since-last-event from the snapshotted ETA so the
+  // displayed value decreases smoothly. Floor at 0 — going negative would
+  // mean Drive is taking longer than projected, which we just show as 0s.
+  const liveEta = () => {
+    const eta = props.upload.etaSeconds;
+    if (eta == null) return null;
+    const elapsedSec = (now() - props.upload.lastUpdatedAt) / 1000;
+    return Math.max(0, eta - elapsedSec);
+  };
+
+  const isDone = () => props.upload.bytes >= props.upload.total;
+
+  return (
+    <div class="upload-progress" title={props.upload.path}>
+      <div class="upload-progress-meta">
+        <span class="upload-progress-name">{props.upload.name}</span>
+        <span class="upload-progress-bytes">
+          {formatBytes(props.upload.bytes)} / {formatBytes(props.upload.total)}
+          {" · "}
+          {pct()}%
+        </span>
+      </div>
+      <div class="upload-progress-bar">
+        <div class="upload-progress-fill" style={{ width: `${pct()}%` }} />
+      </div>
+      <div class="upload-progress-meta upload-progress-stats">
+        <span>
+          {props.upload.speedBps != null
+            ? `${formatBytes(Math.round(props.upload.speedBps))}/s`
+            : "—"}
+        </span>
+        <span>
+          {isDone()
+            ? "done"
+            : liveEta() != null
+              ? `${formatDuration(liveEta()!)} left`
+              : "estimating…"}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let v = n / 1024;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return `${v.toFixed(v >= 10 ? 0 : 1)} ${units[i]}`;
+}
+
+function formatDuration(seconds: number): string {
+  if (!Number.isFinite(seconds)) return "—";
+  const s = Math.round(seconds);
+  if (s < 1) return "<1s";
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rs = s % 60;
+  if (m < 60) return rs > 0 ? `${m}m ${rs}s` : `${m}m`;
+  const h = Math.floor(m / 60);
+  const rm = m % 60;
+  return rm > 0 ? `${h}h ${rm}m` : `${h}h`;
+}
 
 const CONFLICT_POLICIES: { value: string; label: string }[] = [
   { value: "keep-both", label: "Keep both (save conflict copy)" },
@@ -412,6 +725,14 @@ function SyncPairFormModal(props: {
   const [saving, setSaving] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
 
+  // Encryption is set at creation time. We don't expose a toggle in edit
+  // mode because flipping it on/off after files exist would require a
+  // re-upload of every file in the pair — out of scope for v1. The user
+  // sees a read-only badge in edit mode instead.
+  const [encryptionEnabled, setEncryptionEnabled] = createSignal(false);
+  const [passphrase, setPassphrase] = createSignal("");
+  const [passphraseConfirm, setPassphraseConfirm] = createSignal("");
+
   async function pickLocalFolder() {
     try {
       const selected = await open({
@@ -437,6 +758,12 @@ function SyncPairFormModal(props: {
       if (!accountId()) return "Select a Google account.";
       if (!localRoot().trim()) return "Pick a local folder.";
       if (!remoteRootId().trim()) return "Pick a Drive folder.";
+      if (encryptionEnabled()) {
+        if (passphrase().length < 8)
+          return "Passphrase must be at least 8 characters.";
+        if (passphrase() !== passphraseConfirm())
+          return "Passphrases do not match.";
+      }
     }
     const interval = pollInterval();
     if (!Number.isFinite(interval) || interval < 5)
@@ -471,6 +798,7 @@ function SyncPairFormModal(props: {
           mode: mode(),
           conflictPolicy: conflictPolicy(),
           pollIntervalSecs: pollInterval(),
+          encryptionPassphrase: encryptionEnabled() ? passphrase() : null,
         });
       }
       props.onSaved();
@@ -607,6 +935,62 @@ function SyncPairFormModal(props: {
               How often to check Drive for remote changes.
             </span>
           </div>
+
+          <Show when={!editing()}>
+            <div class="form-field">
+              <label>
+                <input
+                  type="checkbox"
+                  checked={encryptionEnabled()}
+                  onChange={(e) => setEncryptionEnabled(e.currentTarget.checked)}
+                />{" "}
+                Encrypt files before uploading to Google Drive
+              </label>
+              <span class="form-hint">
+                Files are encrypted with AES-256-GCM using a key derived from
+                your passphrase (Argon2id). The key is stored in the OS
+                keyring. Encryption can't be toggled on or off after the pair
+                is created.
+              </span>
+            </div>
+            <Show when={encryptionEnabled()}>
+              <div class="form-field">
+                <label>Passphrase</label>
+                <input
+                  type="password"
+                  autocomplete="new-password"
+                  value={passphrase()}
+                  onInput={(e) => setPassphrase(e.currentTarget.value)}
+                />
+                <span class="form-hint">
+                  At least 8 characters. <strong>Lose this and your
+                  encrypted files become unreadable</strong> — there is no
+                  recovery.
+                </span>
+              </div>
+              <div class="form-field">
+                <label>Confirm Passphrase</label>
+                <input
+                  type="password"
+                  autocomplete="new-password"
+                  value={passphraseConfirm()}
+                  onInput={(e) => setPassphraseConfirm(e.currentTarget.value)}
+                />
+              </div>
+            </Show>
+          </Show>
+
+          <Show when={editing() && props.pair?.encryption_enabled}>
+            <div class="form-field readonly-field">
+              <label>Encryption</label>
+              <code>Enabled (AES-256-GCM)</code>
+              <span class="form-hint">
+                If you sync this pair on a different machine, you'll be
+                prompted for the passphrase to unlock it once. The
+                passphrase itself can't be changed in the UI yet.
+              </span>
+            </div>
+          </Show>
         </div>
 
         <div class="modal-footer">

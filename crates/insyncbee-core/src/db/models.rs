@@ -55,6 +55,23 @@ impl Account {
         Ok(())
     }
 
+    pub fn update_credentials(
+        conn: &Connection,
+        id: &str,
+        access: &str,
+        refresh: &str,
+        expiry: &str,
+        display_name: Option<&str>,
+    ) -> Result<()> {
+        conn.execute(
+            "UPDATE accounts
+             SET access_token = ?1, refresh_token = ?2, token_expiry = ?3, display_name = ?4
+             WHERE id = ?5",
+            params![access, refresh, expiry, display_name, id],
+        )?;
+        Ok(())
+    }
+
     pub fn update_change_token(conn: &Connection, id: &str, token: &str) -> Result<()> {
         conn.execute(
             "UPDATE accounts SET change_token = ?1 WHERE id = ?2",
@@ -102,6 +119,19 @@ pub struct SyncPair {
     pub poll_interval_secs: i64,
     pub created_at: String,
     pub updated_at: String,
+
+    /// True when files for this pair are encrypted before upload.
+    /// When set, `encryption_salt` and `encryption_verifier` MUST be Some.
+    #[serde(default)]
+    pub encryption_enabled: bool,
+    /// Argon2id salt used to derive the encryption key from the user's
+    /// passphrase. Skipped from JSON since the UI never needs it.
+    #[serde(skip)]
+    pub encryption_salt: Option<Vec<u8>>,
+    /// AEAD blob used to verify a passphrase without trying a real file
+    /// (see `crypto::FileCipher::make_verifier`). Skipped from JSON.
+    #[serde(skip)]
+    pub encryption_verifier: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -205,6 +235,7 @@ impl SyncPair {
         let mode: String = row.get("mode")?;
         let conflict_policy: String = row.get("conflict_policy")?;
         let status: String = row.get("status")?;
+        let encryption_enabled: i64 = row.get("encryption_enabled")?;
         Ok(Self {
             id: row.get("id")?,
             name: row.get("name")?,
@@ -218,13 +249,16 @@ impl SyncPair {
             poll_interval_secs: row.get("poll_interval_secs")?,
             created_at: row.get("created_at")?,
             updated_at: row.get("updated_at")?,
+            encryption_enabled: encryption_enabled != 0,
+            encryption_salt: row.get("encryption_salt")?,
+            encryption_verifier: row.get("encryption_verifier")?,
         })
     }
 
     pub fn insert(&self, conn: &Connection) -> Result<()> {
         conn.execute(
-            "INSERT INTO sync_pairs (id, name, account_id, local_root, remote_root_id, remote_root_path, mode, conflict_policy, status, poll_interval_secs)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO sync_pairs (id, name, account_id, local_root, remote_root_id, remote_root_path, mode, conflict_policy, status, poll_interval_secs, encryption_enabled, encryption_salt, encryption_verifier)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 self.id,
                 self.name,
@@ -236,7 +270,33 @@ impl SyncPair {
                 self.conflict_policy.to_string(),
                 self.status.to_string(),
                 self.poll_interval_secs,
+                self.encryption_enabled as i64,
+                self.encryption_salt,
+                self.encryption_verifier,
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Persist encryption settings for an existing pair. Used when the
+    /// user enables encryption on a previously-unencrypted pair, or when
+    /// they re-key (which the caller is responsible for actually applying
+    /// to remote files — this method only flips the database flags).
+    pub fn update_encryption(
+        conn: &Connection,
+        id: &str,
+        enabled: bool,
+        salt: Option<&[u8]>,
+        verifier: Option<&[u8]>,
+    ) -> Result<()> {
+        conn.execute(
+            "UPDATE sync_pairs
+             SET encryption_enabled = ?1,
+                 encryption_salt = ?2,
+                 encryption_verifier = ?3,
+                 updated_at = datetime('now')
+             WHERE id = ?4",
+            params![enabled as i64, salt, verifier, id],
         )?;
         Ok(())
     }

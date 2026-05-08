@@ -59,6 +59,69 @@ impl AuthManager {
     /// server to receive the callback, exchanges the code for tokens, fetches
     /// user info, and stores the account in the database.
     pub async fn login(&self) -> anyhow::Result<Account> {
+        let flow = self.run_oauth_flow().await?;
+
+        let account = Account {
+            id: uuid::Uuid::new_v4().to_string(),
+            email: flow.user_info.email,
+            display_name: flow.user_info.name,
+            access_token: flow.access_token,
+            refresh_token: flow.refresh_token,
+            token_expiry: flow.expiry.to_rfc3339(),
+            change_token: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+
+        self.db.with_conn(|conn| {
+            account.insert(conn)?;
+            Ok(())
+        })?;
+
+        tracing::info!("Logged in as {}", account.email);
+        Ok(account)
+    }
+
+    /// Re-run the OAuth flow for an existing account, replacing its stored
+    /// tokens. Use this when a refresh token has been revoked (`invalid_grant`)
+    /// — the account row keeps its `id`, so existing sync pairs stay linked.
+    /// Fails if the user authorizes with a different Google account.
+    pub async fn reconnect_account(&self, account_id: &str) -> anyhow::Result<Account> {
+        let existing = self
+            .db
+            .with_conn(|conn| Account::get_by_id(conn, account_id))?
+            .ok_or_else(|| crate::Error::NotFound(format!("Account {account_id}")))?;
+
+        let flow = self.run_oauth_flow().await?;
+
+        if !flow.user_info.email.eq_ignore_ascii_case(&existing.email) {
+            anyhow::bail!(
+                "Reconnect was authorized as '{}', but this account is '{}'. \
+                 Sign in with the same Google account, or remove this account and add the other one.",
+                flow.user_info.email,
+                existing.email
+            );
+        }
+
+        self.db.with_conn(|conn| {
+            Account::update_credentials(
+                conn,
+                account_id,
+                &flow.access_token,
+                &flow.refresh_token,
+                &flow.expiry.to_rfc3339(),
+                flow.user_info.name.as_deref(),
+            )
+        })?;
+
+        tracing::info!("Reconnected account {}", existing.email);
+        let refreshed = self
+            .db
+            .with_conn(|conn| Account::get_by_id(conn, account_id))?
+            .ok_or_else(|| crate::Error::NotFound(format!("Account {account_id}")))?;
+        Ok(refreshed)
+    }
+
+    async fn run_oauth_flow(&self) -> anyhow::Result<OAuthFlowResult> {
         // Bind to a random port for the loopback redirect
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
@@ -70,10 +133,8 @@ impl AuthManager {
             .set_token_uri(TokenUrl::new(GOOGLE_TOKEN_URL.to_string())?)
             .set_redirect_uri(RedirectUrl::new(redirect_url)?);
 
-        // Generate PKCE challenge
         let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
-        // Build authorization URL.
         // `access_type=offline` → always return a refresh token.
         // `prompt=consent` → force the consent screen so newly declared scopes are
         // actually granted (otherwise Google silently reuses a prior grant).
@@ -95,10 +156,8 @@ impl AuthManager {
             println!("\nOpen this URL in your browser:\n{url_str}\n");
         }
 
-        // Wait for the OAuth callback
         let (code, _state) = receive_callback(listener, &csrf_state)?;
 
-        // Exchange code for tokens
         let http_client = reqwest::Client::new();
         let token_response: TokenResp = client
             .exchange_code(AuthorizationCode::new(code))
@@ -118,27 +177,14 @@ impl AuthManager {
             .unwrap_or(std::time::Duration::from_secs(3600));
         let expiry = chrono::Utc::now() + chrono::Duration::from_std(expires_in).unwrap_or_default();
 
-        // Fetch user info
         let user_info = fetch_user_info(&access_token).await?;
 
-        let account = Account {
-            id: uuid::Uuid::new_v4().to_string(),
-            email: user_info.email,
-            display_name: user_info.name,
+        Ok(OAuthFlowResult {
             access_token,
             refresh_token,
-            token_expiry: expiry.to_rfc3339(),
-            change_token: None,
-            created_at: chrono::Utc::now().to_rfc3339(),
-        };
-
-        self.db.with_conn(|conn| {
-            account.insert(conn)?;
-            Ok(())
-        })?;
-
-        tracing::info!("Logged in as {}", account.email);
-        Ok(account)
+            expiry,
+            user_info,
+        })
     }
 
     /// Refresh the access token for an account.
@@ -198,7 +244,19 @@ impl AuthManager {
     }
 
     pub fn remove_account(&self, account_id: &str) -> Result<()> {
-        self.db.with_conn(|conn| Account::delete(conn, account_id))
+        self.db.with_conn(|conn| {
+            let dependents: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sync_pairs WHERE account_id = ?1",
+                rusqlite::params![account_id],
+                |row| row.get(0),
+            )?;
+            if dependents > 0 {
+                return Err(crate::Error::Other(format!(
+                    "Cannot remove account: {dependents} sync pair(s) still use it. Delete those sync pairs first."
+                )));
+            }
+            Account::delete(conn, account_id)
+        })
     }
 }
 
@@ -242,6 +300,13 @@ fn receive_callback(
     stream.write_all(response.as_bytes())?;
 
     Ok((code, state))
+}
+
+struct OAuthFlowResult {
+    access_token: String,
+    refresh_token: String,
+    expiry: chrono::DateTime<chrono::Utc>,
+    user_info: UserInfo,
 }
 
 #[derive(serde::Deserialize)]

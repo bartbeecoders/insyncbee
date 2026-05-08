@@ -1,7 +1,9 @@
 pub mod auth;
+pub mod crypto;
 pub mod db;
 pub mod drive;
 pub mod error;
+pub mod keystore;
 pub mod sync_engine;
 pub mod watcher;
 

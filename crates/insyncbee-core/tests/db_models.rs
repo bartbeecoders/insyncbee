@@ -24,7 +24,7 @@ fn migrations_run_on_open() {
             )?)
         })
         .unwrap();
-    assert_eq!(v, 1, "expected schema v1 after open_in_memory");
+    assert_eq!(v, 2, "expected schema v2 after open_in_memory");
 }
 
 #[test]
@@ -68,6 +68,9 @@ fn sync_pair_insert_and_list() {
         poll_interval_secs: 60,
         created_at: chrono::Utc::now().to_rfc3339(),
         updated_at: chrono::Utc::now().to_rfc3339(),
+        encryption_enabled: false,
+        encryption_salt: None,
+        encryption_verifier: None,
     };
     db.with_conn(|c| pair.insert(c)).unwrap();
 
@@ -292,5 +295,8 @@ fn sample_pair(account_id: &str, id: &str) -> SyncPair {
         poll_interval_secs: 30,
         created_at: chrono::Utc::now().to_rfc3339(),
         updated_at: chrono::Utc::now().to_rfc3339(),
+        encryption_enabled: false,
+        encryption_salt: None,
+        encryption_verifier: None,
     }
 }

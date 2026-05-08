@@ -1,10 +1,14 @@
 use insyncbee_core::auth::{AuthManager, OAuthCredentials};
+use insyncbee_core::crypto::{self, FileCipher};
 use insyncbee_core::db::models::{
     Account, ChangeLogEntry, ConflictPolicy, FileEntry, FileState, SyncMode, SyncPair,
     SyncPairStatus,
 };
 use insyncbee_core::db::Database;
 use insyncbee_core::drive::HttpDriveClient;
+use insyncbee_core::keystore;
+use std::sync::Arc;
+use tauri::Emitter;
 use insyncbee_core::sync_engine::SyncEngine;
 use insyncbee_core::AppPaths;
 use serde::Serialize;
@@ -99,6 +103,26 @@ async fn start_login(state: State<'_, DbState>) -> Result<Account, String> {
 }
 
 #[tauri::command]
+async fn reconnect_account(
+    state: State<'_, DbState>,
+    account_id: String,
+) -> Result<Account, String> {
+    let (db, creds) = {
+        let s = state.lock().map_err(|e| e.to_string())?;
+        let creds = s
+            .creds
+            .clone()
+            .ok_or_else(|| "OAuth credentials not configured (set INSYNCBEE_CLIENT_ID and INSYNCBEE_CLIENT_SECRET)".to_string())?;
+        (s.db.clone(), creds)
+    };
+
+    let auth = AuthManager::new(creds, db);
+    auth.reconnect_account(&account_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn logout(state: State<DbState>, account_id: String) -> Result<(), String> {
     let s = state.lock().map_err(|e| e.to_string())?;
     s.db.with_conn(|conn| Account::delete(conn, &account_id))
@@ -141,11 +165,25 @@ async fn resolve_conflict(
     let auth = AuthManager::new(creds, db.clone());
     let drive = HttpDriveClient::new(auth, pair.account_id.clone());
 
+    // Build the engine — encrypted pairs need the cipher loaded so the
+    // upload/download helpers do the right thing here.
+    let mut engine = SyncEngine::new(db.clone(), pair.clone());
+    if pair.encryption_enabled {
+        let cipher = keystore::load_cipher(&pair.id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| {
+                "This sync pair is encrypted but the key is not in the keyring. \
+                 Unlock it with the passphrase first."
+                    .to_string()
+            })?;
+        engine = engine.with_cipher(Arc::new(cipher));
+    }
+
     match resolution.as_str() {
         "keep-local" => {
             if local_path.exists() {
-                let file = drive
-                    .update_file(remote_id, &local_path)
+                let file = engine
+                    .update_remote_via(&drive, remote_id, &local_path)
                     .await
                     .map_err(|e| e.to_string())?;
                 // Update index to synced state
@@ -164,8 +202,8 @@ async fn resolve_conflict(
             }
         }
         "keep-remote" => {
-            drive
-                .download_file(remote_id, &local_path)
+            engine
+                .download_via(&drive, remote_id, &local_path)
                 .await
                 .map_err(|e| e.to_string())?;
             let file = drive
@@ -197,8 +235,8 @@ async fn resolve_conflict(
             let conflict_name = format!("{stem} (conflict {timestamp}){ext}");
             let conflict_path = local_path.with_file_name(&conflict_name);
 
-            drive
-                .download_file(remote_id, &conflict_path)
+            engine
+                .download_via(&drive, remote_id, &conflict_path)
                 .await
                 .map_err(|e| e.to_string())?;
 
@@ -230,7 +268,11 @@ async fn resolve_conflict(
 }
 
 #[tauri::command]
-async fn trigger_sync(state: State<'_, DbState>, sync_pair_id: String) -> Result<String, String> {
+async fn trigger_sync(
+    app: tauri::AppHandle,
+    state: State<'_, DbState>,
+    sync_pair_id: String,
+) -> Result<String, String> {
     let (db, creds) = {
         let s = state.lock().map_err(|e| e.to_string())?;
         let creds = s
@@ -246,11 +288,56 @@ async fn trigger_sync(state: State<'_, DbState>, sync_pair_id: String) -> Result
         .ok_or_else(|| format!("Sync pair not found: {sync_pair_id}"))?;
 
     let auth = AuthManager::new(creds, db.clone());
-    let drive = HttpDriveClient::new(auth, pair.account_id.clone());
-    let engine = SyncEngine::new(db, pair);
+
+    // Build a progress callback that bridges the drive client's per-chunk
+    // updates into Tauri events the frontend can listen for. Cloning the
+    // AppHandle is cheap (it's just an Arc internally).
+    let app_clone = app.clone();
+    let pair_id_for_cb = sync_pair_id.clone();
+    let progress_cb: insyncbee_core::drive::ProgressCallback = Arc::new(
+        move |local_path: &std::path::Path, bytes: u64, total: u64| {
+            let name = local_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| local_path.to_string_lossy().into_owned());
+            let payload = UploadProgress {
+                sync_pair_id: pair_id_for_cb.clone(),
+                name,
+                path: local_path.to_string_lossy().into_owned(),
+                bytes,
+                total,
+            };
+            let _ = app_clone.emit("upload-progress", payload);
+        },
+    );
+
+    let drive = HttpDriveClient::new(auth, pair.account_id.clone())
+        .with_progress_callback(progress_cb);
+    let mut engine = SyncEngine::new(db, pair.clone());
+    if pair.encryption_enabled {
+        let cipher = keystore::load_cipher(&pair.id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| {
+                "This sync pair is encrypted but the key is not in the keyring. \
+                 Unlock it with the passphrase first."
+                    .to_string()
+            })?;
+        engine = engine.with_cipher(Arc::new(cipher));
+    }
 
     let report = engine.sync(&drive).await.map_err(|e| e.to_string())?;
+    let _ = app.emit("sync-finished", &sync_pair_id);
     Ok(report.to_string())
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct UploadProgress {
+    sync_pair_id: String,
+    name: String,
+    path: String,
+    bytes: u64,
+    total: u64,
 }
 
 #[tauri::command]
@@ -264,6 +351,7 @@ fn add_sync_pair(
     mode: String,
     conflict_policy: Option<String>,
     poll_interval_secs: Option<i64>,
+    encryption_passphrase: Option<String>,
 ) -> Result<SyncPair, String> {
     let s = state.lock().map_err(|e| e.to_string())?;
 
@@ -277,8 +365,30 @@ fn add_sync_pair(
         Some(p) => p.parse().map_err(|e: insyncbee_core::Error| e.to_string())?,
         None => ConflictPolicy::KeepBoth,
     };
+
+    // ── Encryption setup (if requested) ───────────────────────────
+    // We do this BEFORE inserting the pair so a keyring failure aborts
+    // the whole creation rather than leaving an orphan DB row pointing
+    // at a non-existent key.
+    let pair_id = uuid::Uuid::new_v4().to_string();
+    let (enc_enabled, enc_salt, enc_verifier) =
+        match encryption_passphrase.as_deref().filter(|p| !p.is_empty()) {
+            Some(passphrase) => {
+                let salt = crypto::random_salt();
+                let cipher = FileCipher::from_passphrase(passphrase, &salt)
+                    .map_err(|e| format!("derive key: {e}"))?;
+                let verifier = cipher
+                    .make_verifier(pair_id.as_bytes())
+                    .map_err(|e| format!("make verifier: {e}"))?;
+                keystore::store_key(&pair_id, &cipher)
+                    .map_err(|e| format!("store key in keyring: {e}"))?;
+                (true, Some(salt.to_vec()), Some(verifier))
+            }
+            None => (false, None, None),
+        };
+
     let pair = SyncPair {
-        id: uuid::Uuid::new_v4().to_string(),
+        id: pair_id,
         name,
         account_id,
         local_root,
@@ -290,10 +400,19 @@ fn add_sync_pair(
         poll_interval_secs: poll_interval_secs.unwrap_or(30),
         created_at: chrono::Utc::now().to_rfc3339(),
         updated_at: chrono::Utc::now().to_rfc3339(),
+        encryption_enabled: enc_enabled,
+        encryption_salt: enc_salt,
+        encryption_verifier: enc_verifier,
     };
 
-    s.db.with_conn(|conn| pair.insert(conn))
-        .map_err(|e| e.to_string())?;
+    if let Err(e) = s.db.with_conn(|conn| pair.insert(conn)) {
+        // Roll back the keyring write so the user isn't left with a
+        // dangling entry from a failed creation.
+        if pair.encryption_enabled {
+            let _ = keystore::delete_key(&pair.id);
+        }
+        return Err(e.to_string());
+    }
 
     Ok(pair)
 }
@@ -330,7 +449,78 @@ fn update_sync_pair(
 fn delete_sync_pair(state: State<DbState>, id: String) -> Result<(), String> {
     let s = state.lock().map_err(|e| e.to_string())?;
     s.db.with_conn(|conn| SyncPair::delete(conn, &id))
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // Best-effort keyring cleanup. We don't fail the delete if the
+    // keyring is unavailable — the DB row is already gone, and the
+    // orphaned key is harmless (no pair references it anymore).
+    if let Err(e) = keystore::delete_key(&id) {
+        tracing::warn!("failed to delete keyring entry for pair {id}: {e}");
+    }
+    Ok(())
+}
+
+/// Re-derive the encryption key from a passphrase and stash it in the OS
+/// keyring. Used when the daemon wakes up on a fresh machine where the
+/// keyring entry doesn't exist yet, or after the user revoked the
+/// keyring entry. Verifies the passphrase against the stored verifier
+/// before writing — wrong passphrases are rejected, no keyring write.
+#[tauri::command]
+fn unlock_encryption(
+    state: State<DbState>,
+    sync_pair_id: String,
+    passphrase: String,
+) -> Result<(), String> {
+    let s = state.lock().map_err(|e| e.to_string())?;
+    let pair = s
+        .db
+        .with_conn(|conn| SyncPair::get_by_id(conn, &sync_pair_id))
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Sync pair not found: {sync_pair_id}"))?;
+    if !pair.encryption_enabled {
+        return Err("Sync pair is not encrypted".to_string());
+    }
+    let salt = pair
+        .encryption_salt
+        .as_deref()
+        .ok_or_else(|| "encrypted pair has no salt — DB corrupt".to_string())?;
+    let verifier = pair
+        .encryption_verifier
+        .as_deref()
+        .ok_or_else(|| "encrypted pair has no verifier — DB corrupt".to_string())?;
+
+    let cipher =
+        FileCipher::from_passphrase(&passphrase, salt).map_err(|e| format!("derive key: {e}"))?;
+    let ok = cipher
+        .verify(pair.id.as_bytes(), verifier)
+        .map_err(|e| format!("verify: {e}"))?;
+    if !ok {
+        return Err("Wrong passphrase".to_string());
+    }
+    keystore::store_key(&pair.id, &cipher).map_err(|e| format!("store key: {e}"))?;
+    Ok(())
+}
+
+/// Whether the OS keyring currently holds the encryption key for this
+/// pair. The UI uses this to decide between showing "Sync now" and
+/// "Unlock to sync".
+#[tauri::command]
+fn encryption_unlocked(
+    state: State<DbState>,
+    sync_pair_id: String,
+) -> Result<bool, String> {
+    let s = state.lock().map_err(|e| e.to_string())?;
+    let pair = s
+        .db
+        .with_conn(|conn| SyncPair::get_by_id(conn, &sync_pair_id))
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Sync pair not found: {sync_pair_id}"))?;
+    if !pair.encryption_enabled {
+        // Plain pairs don't need unlocking — they're always "ready".
+        return Ok(true);
+    }
+    Ok(keystore::load_cipher(&pair.id)
+        .map_err(|e| e.to_string())?
+        .is_some())
 }
 
 #[derive(Serialize)]
@@ -415,6 +605,7 @@ pub fn run() {
             pause_sync_pair,
             resume_sync_pair,
             start_login,
+            reconnect_account,
             logout,
             resolve_conflict,
             trigger_sync,
@@ -422,6 +613,8 @@ pub fn run() {
             update_sync_pair,
             delete_sync_pair,
             list_drive_folders,
+            unlock_encryption,
+            encryption_unlocked,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

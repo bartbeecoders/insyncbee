@@ -3,7 +3,9 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use crate::crypto::FileCipher;
 use crate::db::models::{
     ChangeLogEntry, ConflictPolicy, FileEntry, FileState, SyncMode, SyncPair,
 };
@@ -66,11 +68,99 @@ pub enum SyncAction {
 pub struct SyncEngine {
     db: Database,
     pair: SyncPair,
+    /// Cipher used to encrypt/decrypt file contents at the Drive boundary.
+    /// `Some` iff `pair.encryption_enabled`. Leaving it `None` for
+    /// encrypted pairs means uploads/downloads will fail loudly rather
+    /// than silently writing plaintext to Drive — that's the intended
+    /// safety property: callers MUST attach a cipher before sync.
+    cipher: Option<Arc<FileCipher>>,
 }
 
 impl SyncEngine {
     pub fn new(db: Database, pair: SyncPair) -> Self {
-        Self { db, pair }
+        Self { db, pair, cipher: None }
+    }
+
+    /// Attach the cipher derived from the pair's passphrase. Required for
+    /// any pair where `encryption_enabled = true` — without it the engine
+    /// refuses to upload or download (returning an error per file rather
+    /// than ever leaking plaintext to Drive or writing ciphertext to disk).
+    pub fn with_cipher(mut self, cipher: Arc<FileCipher>) -> Self {
+        self.cipher = Some(cipher);
+        self
+    }
+
+    /// Encrypt `local_path` to a fresh temp file and hand the temp file
+    /// to `drive.upload_file`. Falls back to a direct upload when the pair
+    /// isn't encrypted. Errors loudly if the pair is marked encrypted but
+    /// no cipher was attached, so we never push plaintext under that mode.
+    pub async fn upload_via(
+        &self,
+        drive: &dyn DriveClient,
+        parent_id: &str,
+        name: &str,
+        local_path: &Path,
+    ) -> anyhow::Result<DriveFile> {
+        if self.pair.encryption_enabled {
+            let cipher = self.require_cipher()?;
+            let temp = tempfile::NamedTempFile::new()?;
+            cipher.encrypt_file(local_path, temp.path()).await?;
+            let result = drive.upload_file(parent_id, name, temp.path()).await;
+            drop(temp);
+            result
+        } else {
+            drive.upload_file(parent_id, name, local_path).await
+        }
+    }
+
+    pub async fn update_remote_via(
+        &self,
+        drive: &dyn DriveClient,
+        remote_id: &str,
+        local_path: &Path,
+    ) -> anyhow::Result<DriveFile> {
+        if self.pair.encryption_enabled {
+            let cipher = self.require_cipher()?;
+            let temp = tempfile::NamedTempFile::new()?;
+            cipher.encrypt_file(local_path, temp.path()).await?;
+            let result = drive.update_file(remote_id, temp.path()).await;
+            drop(temp);
+            result
+        } else {
+            drive.update_file(remote_id, local_path).await
+        }
+    }
+
+    /// Download `remote_id` and place the plaintext at `local_path`. For
+    /// encrypted pairs we download to a temp file first and decrypt
+    /// onto the destination; that keeps the on-disk file plaintext, which
+    /// is what every other part of the engine (hashing, conflict logic,
+    /// the user's filesystem) expects.
+    pub async fn download_via(
+        &self,
+        drive: &dyn DriveClient,
+        remote_id: &str,
+        local_path: &Path,
+    ) -> anyhow::Result<()> {
+        if self.pair.encryption_enabled {
+            let cipher = self.require_cipher()?;
+            let temp = tempfile::NamedTempFile::new()?;
+            drive.download_file(remote_id, temp.path()).await?;
+            cipher.decrypt_file(temp.path(), local_path).await?;
+            drop(temp);
+            Ok(())
+        } else {
+            drive.download_file(remote_id, local_path).await
+        }
+    }
+
+    fn require_cipher(&self) -> anyhow::Result<&FileCipher> {
+        self.cipher.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "sync pair '{}' is encrypted but no key is loaded — unlock it from the UI before syncing",
+                self.pair.name
+            )
+        })
     }
 
     /// Perform a full sync cycle: scan local, fetch remote, compare, execute actions.
@@ -266,6 +356,18 @@ impl SyncEngine {
                             relative_path: path.clone(),
                             reason: "directory exists on both sides".into(),
                         }
+                    } else if self.pair.encryption_enabled {
+                        // For encrypted pairs we can't compare hashes
+                        // here: local hash is plaintext blake3, remote
+                        // MD5 is over ciphertext we didn't produce. Defer
+                        // to the conflict handler so the user resolves
+                        // it once on first sync, then the base entry
+                        // exists for all future cycles.
+                        SyncAction::Conflict {
+                            relative_path: path.clone(),
+                            local_path: local_root.join(path),
+                            remote_id: file.id.clone(),
+                        }
                     } else {
                         // Compare content
                         let local_hash = watcher::hash_file(&info.absolute_path).ok();
@@ -433,7 +535,7 @@ impl SyncEngine {
                     .resolve_parent_runtime(relative_path, remote_ids)
                     .unwrap_or_else(|| remote_parent_id.clone());
                 tracing::info!("Uploading: {relative_path} (parent {parent_id})");
-                let file = drive.upload_file(&parent_id, &name, local_path).await?;
+                let file = self.upload_via(drive, &parent_id, &name, local_path).await?;
                 self.update_index(relative_path, local_path, &file)?;
             }
             SyncAction::UpdateRemote {
@@ -442,7 +544,7 @@ impl SyncEngine {
                 remote_id,
             } => {
                 tracing::info!("Updating remote: {relative_path}");
-                let file = drive.update_file(remote_id, local_path).await?;
+                let file = self.update_remote_via(drive, remote_id, local_path).await?;
                 self.update_index(relative_path, local_path, &file)?;
             }
             SyncAction::Download {
@@ -451,7 +553,7 @@ impl SyncEngine {
                 local_path,
             } => {
                 tracing::info!("Downloading: {relative_path}");
-                drive.download_file(remote_id, local_path).await?;
+                self.download_via(drive, remote_id, local_path).await?;
                 let file = drive.get_file(remote_id).await?;
                 self.update_index(relative_path, local_path, &file)?;
             }
@@ -579,16 +681,16 @@ impl SyncEngine {
                 let conflict_name = format!("{stem} (conflict {timestamp}){ext}");
                 let conflict_path = local_path.with_file_name(&conflict_name);
 
-                drive.download_file(remote_id, &conflict_path).await?;
+                self.download_via(drive, remote_id, &conflict_path).await?;
                 tracing::info!("Created conflicted copy: {}", conflict_path.display());
             }
             ConflictPolicy::PreferLocal => {
                 // Upload local, overwriting remote
-                drive.update_file(remote_id, local_path).await?;
+                self.update_remote_via(drive, remote_id, local_path).await?;
             }
             ConflictPolicy::PreferRemote => {
                 // Download remote, overwriting local
-                drive.download_file(remote_id, local_path).await?;
+                self.download_via(drive, remote_id, local_path).await?;
             }
             ConflictPolicy::NewestWins => {
                 // Compare modification times
@@ -608,10 +710,10 @@ impl SyncEngine {
 
                 match (local_mtime, remote_mtime) {
                     (Some(l), Some(r)) if l >= r => {
-                        drive.update_file(remote_id, local_path).await?;
+                        self.update_remote_via(drive, remote_id, local_path).await?;
                     }
                     _ => {
-                        drive.download_file(remote_id, local_path).await?;
+                        self.download_via(drive, remote_id, local_path).await?;
                     }
                 }
             }

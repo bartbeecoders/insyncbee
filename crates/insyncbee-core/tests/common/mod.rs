@@ -240,6 +240,9 @@ pub fn make_pair(account_id: &str, local: &Path, remote_root_id: &str, mode: Syn
         poll_interval_secs: 30,
         created_at: chrono::Utc::now().to_rfc3339(),
         updated_at: chrono::Utc::now().to_rfc3339(),
+        encryption_enabled: false,
+        encryption_salt: None,
+        encryption_verifier: None,
     }
 }
 

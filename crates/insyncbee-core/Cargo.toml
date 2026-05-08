@@ -29,6 +29,14 @@ tokio-util = { version = "0.7", features = ["io"] }
 mime_guess = "2"
 async-trait = { workspace = true }
 
+# Encryption
+aes-gcm = "0.10"
+argon2 = "0.5"
+rand = "0.8"
+keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
+zeroize = { version = "1", features = ["derive"] }
+tempfile = "3"
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
