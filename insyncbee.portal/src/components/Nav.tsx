@@ -9,6 +9,7 @@ export default function Nav() {
           <span>InSyncBee</span>
         </a>
         <nav className="nav-links" aria-label="Primary">
+          <a className="nav-link" href="#whats-new">What's new</a>
           <a className="nav-link" href="#features">Features</a>
           <a className="nav-link" href="#how">How it works</a>
           <a className="nav-link" href="#compare">Compare</a>

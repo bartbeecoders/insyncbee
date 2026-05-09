@@ -303,6 +303,50 @@ h3 {
   50% { transform: translateY(-8px); }
 }
 
+/* ── What's New ─────────────────────────────────────────────────── */
+
+.whats-new-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  margin-bottom: 24px;
+  flex-wrap: wrap;
+}
+
+.whats-new-head h2 { margin: 0; }
+
+.whats-new-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 14px;
+}
+@media (max-width: 920px) { .whats-new-grid { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 620px) { .whats-new-grid { grid-template-columns: 1fr; } }
+
+.whats-new-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-lg);
+  padding: 18px 20px;
+}
+
+.whats-new-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent);
+  margin-bottom: 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.whats-new-body {
+  color: var(--text-muted);
+  font-size: 14px;
+  line-height: 1.55;
+}
+
 /* ── Features ───────────────────────────────────────────────────── */
 
 .features-grid {

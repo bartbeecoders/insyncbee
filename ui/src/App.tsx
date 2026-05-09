@@ -1,8 +1,10 @@
-import { createSignal, createResource, Show, For, onMount, onCleanup } from "solid-js";
+import { createSignal, createResource, Show, For, onMount, onCleanup, JSX } from "solid-js";
 import { createStore, produce } from "solid-js/store";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
+import changelogMd from "../../CHANGELOG.md?raw";
+
+const APP_VERSION = "0.2.0";
 
 interface UploadProgress {
   syncPairId: string;
@@ -50,6 +52,11 @@ interface DriveFolder {
   name: string;
 }
 
+interface LocalFolder {
+  name: string;
+  path: string;
+}
+
 interface FileEntry {
   id: number;
   sync_pair_id: string;
@@ -69,7 +76,7 @@ interface ChangeLogEntry {
   created_at: string;
 }
 
-type Tab = "dashboard" | "activity" | "conflicts";
+type Tab = "dashboard" | "activity" | "conflicts" | "settings" | "about";
 
 function App() {
   const [tab, setTab] = createSignal<Tab>("dashboard");
@@ -164,6 +171,18 @@ function App() {
           >
             Conflicts
           </button>
+          <button
+            class={tab() === "settings" ? "tab active" : "tab"}
+            onClick={() => setTab("settings")}
+          >
+            Settings
+          </button>
+          <button
+            class={tab() === "about" ? "tab active" : "tab"}
+            onClick={() => setTab("about")}
+          >
+            About
+          </button>
         </nav>
       </header>
 
@@ -186,8 +205,175 @@ function App() {
             selectedPair={selectedPair()}
           />
         </Show>
+        <Show when={tab() === "settings"}>
+          <SettingsView />
+        </Show>
+        <Show when={tab() === "about"}>
+          <AboutView />
+        </Show>
       </main>
     </div>
+  );
+}
+
+function AboutView() {
+  return (
+    <section class="section">
+      <div class="section-header">
+        <h2>About InSyncBee</h2>
+      </div>
+      <div class="about-meta">
+        <div>
+          <span class="about-label">Version</span>
+          <span class="about-value">{APP_VERSION}</span>
+        </div>
+        <div>
+          <span class="about-label">License</span>
+          <span class="about-value">MIT</span>
+        </div>
+        <div>
+          <span class="about-label">Source</span>
+          <a
+            class="about-link"
+            href="https://github.com/bartbeecoders/insyncbee"
+            target="_blank"
+            rel="noreferrer"
+          >
+            github.com/bartbeecoders/insyncbee
+          </a>
+        </div>
+      </div>
+      <h3 class="about-changelog-heading">Changelog</h3>
+      <Changelog source={changelogMd} />
+    </section>
+  );
+}
+
+// Tiny renderer for the small subset of Markdown the changelog uses:
+// `## v…` headings, `### Added/Fixed/Changed` sub-headings, `- ` bullet
+// lists (with continuation lines), paragraphs, and `**bold**` inline.
+// Everything before the first `## ` heading (the file's intro paragraph)
+// is dropped because it doesn't belong on an in-app About page.
+function Changelog(props: { source: string }) {
+  const lines = props.source.split("\n");
+  const start = lines.findIndex((l) => l.startsWith("## "));
+  const body = start >= 0 ? lines.slice(start) : lines;
+
+  const blocks: JSX.Element[] = [];
+  let i = 0;
+  while (i < body.length) {
+    const line = body[i];
+    if (line.startsWith("## ")) {
+      blocks.push(<h4 class="changelog-version">{line.slice(3)}</h4>);
+      i++;
+    } else if (line.startsWith("### ")) {
+      blocks.push(<h5 class="changelog-section">{line.slice(4)}</h5>);
+      i++;
+    } else if (line.startsWith("- ")) {
+      const items: string[] = [];
+      while (
+        i < body.length &&
+        (body[i].startsWith("- ") || body[i].startsWith("  "))
+      ) {
+        if (body[i].startsWith("- ")) {
+          items.push(body[i].slice(2));
+        } else if (items.length > 0) {
+          items[items.length - 1] += " " + body[i].trim();
+        }
+        i++;
+      }
+      blocks.push(
+        <ul class="changelog-list">
+          <For each={items}>{(it) => <li>{renderInline(it)}</li>}</For>
+        </ul>,
+      );
+    } else if (line.trim() === "") {
+      i++;
+    } else {
+      const para: string[] = [line];
+      i++;
+      while (
+        i < body.length &&
+        body[i].trim() !== "" &&
+        !body[i].startsWith("#") &&
+        !body[i].startsWith("- ")
+      ) {
+        para.push(body[i]);
+        i++;
+      }
+      blocks.push(<p class="changelog-p">{renderInline(para.join(" "))}</p>);
+    }
+  }
+  return <div class="changelog">{blocks}</div>;
+}
+
+function renderInline(text: string): JSX.Element {
+  const out: JSX.Element[] = [];
+  const re = /\*\*([^*]+)\*\*/g;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) out.push(text.slice(last, m.index));
+    out.push(<strong>{m[1]}</strong>);
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) out.push(text.slice(last));
+  return out;
+}
+
+function SettingsView() {
+  const [autostart, setAutostart] = createSignal<boolean | null>(null);
+  const [busy, setBusy] = createSignal(false);
+  const [error, setError] = createSignal<string | null>(null);
+
+  onMount(async () => {
+    try {
+      setAutostart(await invoke<boolean>("autostart_enabled"));
+    } catch (e) {
+      setError(String(e));
+    }
+  });
+
+  async function toggle() {
+    const next = !autostart();
+    setBusy(true);
+    setError(null);
+    try {
+      await invoke(next ? "autostart_enable" : "autostart_disable");
+      setAutostart(next);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section class="section">
+      <div class="section-header">
+        <h2>Settings</h2>
+      </div>
+      <div class="settings-row">
+        <div>
+          <div class="settings-label">Start on login</div>
+          <div class="settings-help">
+            Launch InSyncBee in the background (tray only) when you log in.
+          </div>
+        </div>
+        <label class="toggle">
+          <input
+            type="checkbox"
+            checked={autostart() === true}
+            disabled={autostart() === null || busy()}
+            onChange={toggle}
+          />
+          <span>{autostart() ? "On" : "Off"}</span>
+        </label>
+      </div>
+      <Show when={error()}>
+        <div class="error">{error()}</div>
+      </Show>
+    </section>
   );
 }
 
@@ -721,6 +907,7 @@ function SyncPairFormModal(props: {
   const [pollInterval, setPollInterval] = createSignal(
     props.pair?.poll_interval_secs ?? 30,
   );
+  const [showLocalPicker, setShowLocalPicker] = createSignal(false);
   const [showRemotePicker, setShowRemotePicker] = createSignal(false);
   const [saving, setSaving] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
@@ -732,25 +919,6 @@ function SyncPairFormModal(props: {
   const [encryptionEnabled, setEncryptionEnabled] = createSignal(false);
   const [passphrase, setPassphrase] = createSignal("");
   const [passphraseConfirm, setPassphraseConfirm] = createSignal("");
-
-  async function pickLocalFolder() {
-    try {
-      const selected = await open({
-        directory: true,
-        multiple: false,
-        title: "Select local sync folder",
-      });
-      if (typeof selected === "string") {
-        setLocalRoot(selected);
-        if (!name()) {
-          const base = selected.split("/").filter(Boolean).pop();
-          if (base) setName(base);
-        }
-      }
-    } catch (e) {
-      setError(`Failed to open folder picker: ${e}`);
-    }
-  }
 
   function validate(): string | null {
     if (!name().trim()) return "Name is required.";
@@ -856,7 +1024,7 @@ function SyncPairFormModal(props: {
                   placeholder="No folder selected"
                   onInput={(e) => setLocalRoot(e.currentTarget.value)}
                 />
-                <button class="btn btn-sm" onClick={pickLocalFolder}>
+                <button class="btn btn-sm" onClick={() => setShowLocalPicker(true)}>
                   Browse…
                 </button>
               </div>
@@ -1017,6 +1185,166 @@ function SyncPairFormModal(props: {
             }}
           />
         </Show>
+        <Show when={showLocalPicker()}>
+          <LocalFolderPicker
+            initialPath={localRoot()}
+            onCancel={() => setShowLocalPicker(false)}
+            onSelect={(path) => {
+              setLocalRoot(path);
+              if (!name()) {
+                const base = path.split("/").filter(Boolean).pop();
+                if (base) setName(base);
+              }
+              setShowLocalPicker(false);
+            }}
+          />
+        </Show>
+      </div>
+    </div>
+  );
+}
+
+// ── Local Folder Picker ───────────────────────────────────────────
+
+function LocalFolderPicker(props: {
+  initialPath: string;
+  onSelect: (path: string) => void;
+  onCancel: () => void;
+}) {
+  const [currentPath, setCurrentPath] = createSignal(props.initialPath || "");
+  const [newFolderName, setNewFolderName] = createSignal("");
+  const [creating, setCreating] = createSignal(false);
+  const [error, setError] = createSignal<string | null>(null);
+
+  onMount(async () => {
+    if (!currentPath()) {
+      try {
+        setCurrentPath(await invoke<string>("default_local_folder"));
+      } catch (e) {
+        setError(String(e));
+        setCurrentPath("/");
+      }
+    }
+  });
+
+  const [folders, { refetch }] = createResource(currentPath, async (path) => {
+    try {
+      setError(null);
+      return await invoke<LocalFolder[]>("list_local_folders", { path });
+    } catch (e) {
+      setError(String(e));
+      return [];
+    }
+  });
+
+  async function goUp() {
+    try {
+      const parent = await invoke<string | null>("parent_local_folder", {
+        path: currentPath(),
+      });
+      if (parent) setCurrentPath(parent);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function createFolder() {
+    const folderName = newFolderName().trim();
+    if (!folderName) return;
+    setCreating(true);
+    try {
+      const folder = await invoke<LocalFolder>("create_local_folder", {
+        parentPath: currentPath(),
+        name: folderName,
+      });
+      setNewFolderName("");
+      await refetch();
+      setCurrentPath(folder.path);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  return (
+    <div class="modal-backdrop nested" onClick={props.onCancel}>
+      <div class="modal modal-sm" onClick={(e) => e.stopPropagation()}>
+        <div class="modal-header">
+          <h2>Pick Local Folder</h2>
+          <button class="btn btn-sm btn-ghost" onClick={props.onCancel}>
+            ✕
+          </button>
+        </div>
+
+        <div class="breadcrumbs">
+          <button class="crumb" onClick={goUp}>
+            Up
+          </button>
+          <span class="crumb-sep">/</span>
+          <span class="crumb current-path">{currentPath()}</span>
+        </div>
+
+        <div class="modal-body picker-body">
+          <Show when={error()}>
+            <p class="error-msg">{error()}</p>
+          </Show>
+          <div class="create-folder-row">
+            <input
+              type="text"
+              value={newFolderName()}
+              placeholder="New folder name"
+              onInput={(e) => setNewFolderName(e.currentTarget.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") createFolder();
+              }}
+            />
+            <button
+              class="btn btn-sm"
+              disabled={creating() || !newFolderName().trim()}
+              onClick={createFolder}
+            >
+              Create
+            </button>
+          </div>
+          <Show
+            when={!folders.loading}
+            fallback={<p class="empty">Loading…</p>}
+          >
+            <Show
+              when={(folders() ?? []).length > 0}
+              fallback={
+                <p class="empty">No subfolders here. Select this folder?</p>
+              }
+            >
+              <div class="picker-list">
+                <For each={folders()}>
+                  {(f) => (
+                    <button
+                      class="picker-item"
+                      onClick={() => setCurrentPath(f.path)}
+                    >
+                      <span class="picker-icon">📁</span>
+                      <span>{f.name}</span>
+                    </button>
+                  )}
+                </For>
+              </div>
+            </Show>
+          </Show>
+        </div>
+
+        <div class="modal-footer">
+          <span class="picker-hint">
+            Selecting: <code>{currentPath()}</code>
+          </span>
+          <button class="btn btn-ghost" onClick={props.onCancel}>
+            Cancel
+          </button>
+          <button class="btn btn-primary" onClick={() => props.onSelect(currentPath())}>
+            Select This Folder
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -1033,13 +1361,15 @@ function DriveFolderPicker(props: {
   const [stack, setStack] = createSignal<{ id: string; name: string }[]>([
     { id: "root", name: "My Drive" },
   ]);
+  const [newFolderName, setNewFolderName] = createSignal("");
+  const [creating, setCreating] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
 
   const current = () => stack()[stack().length - 1];
   const pathString = () =>
     "/" + stack().slice(1).map((s) => s.name).join("/");
 
-  const [folders] = createResource(current, async (c) => {
+  const [folders, { refetch }] = createResource(current, async (c) => {
     try {
       setError(null);
       return await invoke<DriveFolder[]>("list_drive_folders", {
@@ -1064,6 +1394,26 @@ function DriveFolderPicker(props: {
     const c = current();
     const path = stack().length === 1 ? "/" : pathString();
     props.onSelect(c.id, path);
+  }
+
+  async function createFolder() {
+    const folderName = newFolderName().trim();
+    if (!folderName) return;
+    setCreating(true);
+    try {
+      const folder = await invoke<DriveFolder>("create_drive_folder", {
+        accountId: props.accountId,
+        parentId: current().id,
+        name: folderName,
+      });
+      setNewFolderName("");
+      await refetch();
+      setStack([...stack(), { id: folder.id, name: folder.name }]);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setCreating(false);
+    }
   }
 
   return (
@@ -1099,6 +1449,24 @@ function DriveFolderPicker(props: {
           <Show when={error()}>
             <p class="error-msg">{error()}</p>
           </Show>
+          <div class="create-folder-row">
+            <input
+              type="text"
+              value={newFolderName()}
+              placeholder="New folder name"
+              onInput={(e) => setNewFolderName(e.currentTarget.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") createFolder();
+              }}
+            />
+            <button
+              class="btn btn-sm"
+              disabled={creating() || !newFolderName().trim()}
+              onClick={createFolder}
+            >
+              Create
+            </button>
+          </div>
           <Show
             when={!folders.loading}
             fallback={<p class="empty">Loading…</p>}

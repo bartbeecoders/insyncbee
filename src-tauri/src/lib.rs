@@ -12,12 +12,16 @@ use tauri::Emitter;
 use insyncbee_core::sync_engine::SyncEngine;
 use insyncbee_core::AppPaths;
 use serde::Serialize;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use tauri::{Manager, State};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{Manager, State, WindowEvent};
+use tauri_plugin_autostart::{ManagerExt, MacosLauncher};
 
 struct AppState {
     db: Database,
-    paths: AppPaths,
     creds: Option<OAuthCredentials>,
 }
 
@@ -523,10 +527,88 @@ fn encryption_unlocked(
         .is_some())
 }
 
+// ── Autostart ────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn autostart_enabled(app: tauri::AppHandle) -> Result<bool, String> {
+    app.autolaunch().is_enabled().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn autostart_enable(app: tauri::AppHandle) -> Result<(), String> {
+    app.autolaunch().enable().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn autostart_disable(app: tauri::AppHandle) -> Result<(), String> {
+    app.autolaunch().disable().map_err(|e| e.to_string())
+}
+
 #[derive(Serialize)]
 struct DriveFolder {
     id: String,
     name: String,
+}
+
+#[derive(Serialize)]
+struct LocalFolder {
+    name: String,
+    path: String,
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+fn display_path(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+#[tauri::command]
+fn default_local_folder() -> Result<String, String> {
+    let path = home_dir().unwrap_or_else(|| PathBuf::from("/"));
+    Ok(display_path(&path))
+}
+
+#[tauri::command]
+fn parent_local_folder(path: String) -> Result<Option<String>, String> {
+    let path = PathBuf::from(path);
+    Ok(path.parent().map(display_path))
+}
+
+#[tauri::command]
+fn list_local_folders(path: String) -> Result<Vec<LocalFolder>, String> {
+    let mut folders = Vec::new();
+    for entry in fs::read_dir(&path).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let file_type = entry.file_type().map_err(|e| e.to_string())?;
+        if file_type.is_dir() {
+            folders.push(LocalFolder {
+                name: entry.file_name().to_string_lossy().into_owned(),
+                path: display_path(&entry.path()),
+            });
+        }
+    }
+    folders.sort_by_key(|f| f.name.to_lowercase());
+    Ok(folders)
+}
+
+#[tauri::command]
+fn create_local_folder(parent_path: String, name: String) -> Result<LocalFolder, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("Folder name is required".to_string());
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return Err("Folder name cannot contain path separators".to_string());
+    }
+
+    let path = PathBuf::from(parent_path).join(trimmed);
+    fs::create_dir(&path).map_err(|e| e.to_string())?;
+    Ok(LocalFolder {
+        name: trimmed.to_string(),
+        path: display_path(&path),
+    })
 }
 
 #[tauri::command]
@@ -564,6 +646,43 @@ async fn list_drive_folders(
     Ok(folders)
 }
 
+#[tauri::command]
+async fn create_drive_folder(
+    state: State<'_, DbState>,
+    account_id: String,
+    parent_id: String,
+    name: String,
+) -> Result<DriveFolder, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("Folder name is required".to_string());
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return Err("Folder name cannot contain path separators".to_string());
+    }
+
+    let (db, creds) = {
+        let s = state.lock().map_err(|e| e.to_string())?;
+        let creds = s
+            .creds
+            .clone()
+            .ok_or_else(|| "OAuth credentials not configured".to_string())?;
+        (s.db.clone(), creds)
+    };
+
+    let auth = AuthManager::new(creds, db);
+    let drive = HttpDriveClient::new(auth, account_id);
+    let folder = drive
+        .create_folder(&parent_id, trimmed)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(DriveFolder {
+        id: folder.id,
+        name: folder.name,
+    })
+}
+
 // ── App Setup ────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -573,12 +692,19 @@ pub fn run() {
 
     let creds = OAuthCredentials::from_env().ok();
 
-    let app_state = AppState { db, paths, creds };
+    let app_state = AppState { db, creds };
+
+    let start_in_tray = std::env::args()
+        .any(|a| a == "--tray" || a == "--background" || a == "--hidden");
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
-        .setup(|app| {
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            Some(vec!["--tray"]),
+        ))
+        .setup(move |app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()
@@ -587,12 +713,68 @@ pub fn run() {
                 )?;
             }
 
-            // Show main window after setup
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
+            let show_item =
+                MenuItem::with_id(app, "show", "Open InSyncBee", true, None::<&str>)?;
+            let separator = PredefinedMenuItem::separator(app)?;
+            let quit_item =
+                MenuItem::with_id(app, "quit", "Quit InSyncBee", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show_item, &separator, &quit_item])?;
+
+            TrayIconBuilder::with_id("main")
+                .icon(app.default_window_icon().expect("missing default icon").clone())
+                .icon_as_template(true)
+                .tooltip("InSyncBee - Google Drive Sync")
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "show" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.unminimize();
+                            let _ = window.set_focus();
+                        }
+                    }
+                    "quit" => {
+                        app.exit(0);
+                    }
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        let app = tray.app_handle();
+                        if let Some(window) = app.get_webview_window("main") {
+                            if window.is_visible().unwrap_or(false) {
+                                let _ = window.hide();
+                            } else {
+                                let _ = window.show();
+                                let _ = window.unminimize();
+                                let _ = window.set_focus();
+                            }
+                        }
+                    }
+                })
+                .build(app)?;
+
+            if !start_in_tray {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                }
             }
 
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if window.label() == "main" {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
         })
         .manage(Mutex::new(app_state))
         .invoke_handler(tauri::generate_handler![
@@ -612,9 +794,17 @@ pub fn run() {
             add_sync_pair,
             update_sync_pair,
             delete_sync_pair,
+            default_local_folder,
+            parent_local_folder,
+            list_local_folders,
+            create_local_folder,
             list_drive_folders,
+            create_drive_folder,
             unlock_encryption,
             encryption_unlocked,
+            autostart_enabled,
+            autostart_enable,
+            autostart_disable,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

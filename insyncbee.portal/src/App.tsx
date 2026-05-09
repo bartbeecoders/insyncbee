@@ -1,5 +1,6 @@
 import Nav from "./components/Nav";
 import Hero from "./components/Hero";
+import WhatsNew from "./components/WhatsNew";
 import Features from "./components/Features";
 import HowItWorks from "./components/HowItWorks";
 import Download from "./components/Download";
@@ -13,6 +14,7 @@ export default function App() {
       <Nav />
       <main>
         <Hero />
+        <WhatsNew />
         <Features />
         <HowItWorks />
         <Download />

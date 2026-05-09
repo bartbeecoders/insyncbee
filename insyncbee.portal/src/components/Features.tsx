@@ -22,13 +22,14 @@ const FEATURES = [
     ),
   },
   {
-    title: "On-demand placeholders",
+    title: "Per-pair encryption",
     body:
-      "See your whole Drive in Finder/Explorer, fetch files only when you open them. Terabytes without the disk cost.",
+      "Optional client-side encryption per sync pair. Files are encrypted before they leave your machine; keys live in your OS keyring, never on Drive.",
     icon: (
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-        <path d="M21 15V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2h9" />
-        <polyline points="8 10 12 14 16 10" /><path d="M19 21v-6" /><circle cx="19" cy="18" r="1" />
+        <rect x="4" y="11" width="16" height="10" rx="2" />
+        <path d="M8 11V7a4 4 0 018 0v4" />
+        <circle cx="12" cy="16" r="1.5" fill="currentColor" />
       </svg>
     ),
   },
@@ -44,13 +45,16 @@ const FEATURES = [
     ),
   },
   {
-    title: "Bandwidth control",
+    title: "Lives in your tray",
     body:
-      "Upload and download caps per hour, schedule, or connection type. Stop Insync from eating your tethered laptop.",
+      "Background-first design: tray icon, close-to-tray, optional start-on-login. Sync keeps running while the window is closed.",
     icon: (
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-        <circle cx="12" cy="12" r="10" />
-        <path d="M12 6v6l4 2" />
+        <rect x="3" y="4" width="18" height="13" rx="2" />
+        <path d="M3 13h18" />
+        <path d="M8 21h8" /><path d="M12 17v4" />
+        <circle cx="7" cy="9" r="0.6" fill="currentColor" />
+        <circle cx="10" cy="9" r="0.6" fill="currentColor" />
       </svg>
     ),
   },

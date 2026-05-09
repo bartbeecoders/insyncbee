@@ -31,9 +31,9 @@ export interface Releases {
 // the portal Docker build — every filename is derived from `version` so a
 // tag bump propagates everywhere automatically.
 export const DEFAULT_RELEASES: Releases = {
-  version: "0.1.0",
+  version: "0.2.0",
   channel: "dev",
-  releasedAt: "2026-04-18",
+  releasedAt: "2026-05-09",
   product: "insyncbee-db-service",
   repo: "bartbeecoders/insyncbee",
   platforms: [
