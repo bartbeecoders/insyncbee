@@ -29,6 +29,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      # `--workspace` includes src-tauri (insyncbee-gui), whose gdk-sys /
+      # webkit2gtk-sys build scripts need these headers via pkg-config.
+      # Without them the whole job dies before a single test runs.
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+
       - name: Build workspace
         run: cargo build --workspace --tests --locked
 
