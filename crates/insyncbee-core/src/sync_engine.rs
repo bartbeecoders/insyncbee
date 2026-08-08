@@ -246,15 +246,17 @@ impl SyncEngine {
         // 5. Execute actions
         for action in &actions {
             match self.execute_action(action, drive, &local_root, &mut remote_ids).await {
-                Ok(()) => match action {
+                Ok(metrics) => match action {
                     SyncAction::Upload { relative_path, .. }
                     | SyncAction::UpdateRemote { relative_path, .. } => {
                         report.uploaded += 1;
-                        self.log_change(relative_path, "upload", None);
+                        report.bytes_uploaded += metrics.map_or(0, |m| m.bytes);
+                        self.log_transfer(relative_path, "upload", metrics);
                     }
                     SyncAction::Download { relative_path, .. } => {
                         report.downloaded += 1;
-                        self.log_change(relative_path, "download", None);
+                        report.bytes_downloaded += metrics.map_or(0, |m| m.bytes);
+                        self.log_transfer(relative_path, "download", metrics);
                     }
                     SyncAction::DeleteLocal { relative_path, .. } => {
                         report.deleted += 1;
@@ -560,7 +562,11 @@ impl SyncEngine {
         drive: &dyn DriveClient,
         _local_root: &Path,
         remote_ids: &mut HashMap<String, String>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<TransferMetrics>> {
+        // Set by the arms that move bytes; everything else returns None and
+        // is logged without a size or a speed.
+        let mut metrics: Option<TransferMetrics> = None;
+
         match action {
             SyncAction::Upload {
                 relative_path,
@@ -580,7 +586,9 @@ impl SyncEngine {
                     .resolve_parent_runtime(relative_path, remote_ids)
                     .unwrap_or_else(|| remote_parent_id.clone());
                 tracing::info!("Uploading: {relative_path} (parent {parent_id})");
+                let started = std::time::Instant::now();
                 let file = self.upload_via(drive, &parent_id, &name, local_path).await?;
+                metrics = Some(TransferMetrics::measured(local_size(local_path), started));
                 self.update_index(relative_path, local_path, &file)?;
             }
             SyncAction::UpdateRemote {
@@ -589,7 +597,9 @@ impl SyncEngine {
                 remote_id,
             } => {
                 tracing::info!("Updating remote: {relative_path}");
+                let started = std::time::Instant::now();
                 let file = self.update_remote_via(drive, remote_id, local_path).await?;
+                metrics = Some(TransferMetrics::measured(local_size(local_path), started));
                 self.update_index(relative_path, local_path, &file)?;
             }
             SyncAction::Download {
@@ -598,7 +608,11 @@ impl SyncEngine {
                 local_path,
             } => {
                 tracing::info!("Downloading: {relative_path}");
+                let started = std::time::Instant::now();
                 self.download_via(drive, remote_id, local_path).await?;
+                // Measure before get_file: that metadata round-trip is not
+                // part of the transfer and would drag the speed down.
+                metrics = Some(TransferMetrics::measured(local_size(local_path), started));
                 let file = drive.get_file(remote_id).await?;
                 self.update_index(relative_path, local_path, &file)?;
             }
@@ -702,7 +716,7 @@ impl SyncEngine {
                 tracing::debug!("Skipping {relative_path}: {reason}");
             }
         }
-        Ok(())
+        Ok(metrics)
     }
 
     /// Handle a conflict according to the pair's conflict policy.
@@ -1004,6 +1018,67 @@ impl SyncEngine {
             Ok(())
         });
     }
+
+    /// Log a transfer with what it moved, so the activity feed can show a
+    /// speed and the statistics page can sum it.
+    fn log_transfer(&self, path: &str, action: &str, metrics: Option<TransferMetrics>) {
+        let _ = self.db.with_conn(|conn| {
+            ChangeLogEntry::insert_transfer(
+                conn,
+                &self.pair.id,
+                path,
+                action,
+                None,
+                metrics.map(|m| m.bytes as i64),
+                metrics.map(|m| m.duration_ms as i64),
+            )?;
+            Ok(())
+        });
+    }
+}
+
+/// What a single transfer moved, and how long it took.
+#[derive(Debug, Clone, Copy)]
+pub struct TransferMetrics {
+    pub bytes: u64,
+    pub duration_ms: u64,
+}
+
+impl TransferMetrics {
+    fn measured(bytes: u64, started: std::time::Instant) -> Self {
+        Self {
+            bytes,
+            // Round up: a sub-millisecond transfer of a small file would
+            // otherwise record 0 ms and make the speed calculation divide
+            // by zero.
+            duration_ms: (started.elapsed().as_millis() as u64).max(1),
+        }
+    }
+}
+
+/// Render a byte count the way a person reads it: `1.4 MB`, not `1468006`.
+pub fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
+
+/// Size of a local file, or 0 when it can't be read.
+///
+/// For encrypted pairs this is the plaintext size, not the ciphertext that
+/// actually crossed the wire. That's the deliberate choice: users measure
+/// their transfers against the files they can see, and the difference is a
+/// small constant per-chunk overhead.
+fn local_size(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
 impl SyncAction {
@@ -1083,14 +1158,22 @@ pub struct SyncReport {
     pub conflicts: usize,
     pub skipped: usize,
     pub errors: usize,
+    pub bytes_uploaded: u64,
+    pub bytes_downloaded: u64,
 }
 
 impl std::fmt::Display for SyncReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} uploaded, {} downloaded, {} deleted, {} conflicts, {} errors",
-            self.uploaded, self.downloaded, self.deleted, self.conflicts, self.errors
+            "{} uploaded ({}), {} downloaded ({}), {} deleted, {} conflicts, {} errors",
+            self.uploaded,
+            format_bytes(self.bytes_uploaded),
+            self.downloaded,
+            format_bytes(self.bytes_downloaded),
+            self.deleted,
+            self.conflicts,
+            self.errors
         )
     }
 }

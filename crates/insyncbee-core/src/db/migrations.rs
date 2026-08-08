@@ -18,7 +18,7 @@ pub fn run_all(conn: &Connection) -> Result<()> {
         )
         .unwrap_or(0);
 
-    let migrations: &[(&str, i64)] = &[(MIGRATION_001, 1), (MIGRATION_002, 2)];
+    let migrations: &[(&str, i64)] = &[(MIGRATION_001, 1), (MIGRATION_002, 2), (MIGRATION_003, 3)];
 
     for (sql, version) in migrations {
         if *version > current {
@@ -116,4 +116,17 @@ const MIGRATION_002: &str = "
 ALTER TABLE sync_pairs ADD COLUMN encryption_enabled INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE sync_pairs ADD COLUMN encryption_salt BLOB;
 ALTER TABLE sync_pairs ADD COLUMN encryption_verifier BLOB;
+";
+
+// ── v3: transfer accounting ─────────────────────────────────────────
+// `bytes` and `duration_ms` on each upload/download row are what the
+// statistics page sums and what the activity feed divides to show a
+// per-transfer speed. Both are nullable on purpose: rows written before
+// this migration have no measurement, and inventing one (0, or a
+// back-filled file size with no duration) would quietly corrupt every
+// average computed over them. NULL means "not measured", and the
+// aggregates say so.
+const MIGRATION_003: &str = "
+ALTER TABLE change_log ADD COLUMN bytes INTEGER;
+ALTER TABLE change_log ADD COLUMN duration_ms INTEGER;
 ";

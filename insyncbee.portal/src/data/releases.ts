@@ -46,7 +46,7 @@ export interface Releases {
 // `version: "…"` and one `releasedAt: "…"` in this file: the deploy-portal
 // sed is unanchored and would rewrite any others too.
 export const DEFAULT_RELEASES: Releases = {
-  version: "0.2.4",
+  version: "0.2.5",
   channel: "dev",
   releasedAt: "2026-08-08",
   repo: "bartbeecoders/insyncbee",

@@ -524,13 +524,33 @@ pub struct ChangeLogEntry {
     pub action: String,
     pub detail: Option<String>,
     pub created_at: String,
+    /// Bytes moved, for `upload`/`download` rows. `None` for everything
+    /// else, and for transfers logged before schema v3.
+    pub bytes: Option<i64>,
+    /// Wall-clock duration of that transfer. Pairs with `bytes` to give a
+    /// per-file speed; `None` under the same conditions.
+    pub duration_ms: Option<i64>,
 }
 
 impl ChangeLogEntry {
     pub fn insert(conn: &Connection, sync_pair_id: &str, path: &str, action: &str, detail: Option<&str>) -> Result<()> {
+        Self::insert_transfer(conn, sync_pair_id, path, action, detail, None, None)
+    }
+
+    /// Log an action along with what it moved and how long it took.
+    pub fn insert_transfer(
+        conn: &Connection,
+        sync_pair_id: &str,
+        path: &str,
+        action: &str,
+        detail: Option<&str>,
+        bytes: Option<i64>,
+        duration_ms: Option<i64>,
+    ) -> Result<()> {
         conn.execute(
-            "INSERT INTO change_log (sync_pair_id, relative_path, action, detail) VALUES (?1, ?2, ?3, ?4)",
-            params![sync_pair_id, path, action, detail],
+            "INSERT INTO change_log (sync_pair_id, relative_path, action, detail, bytes, duration_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![sync_pair_id, path, action, detail, bytes, duration_ms],
         )?;
         Ok(())
     }
@@ -539,20 +559,163 @@ impl ChangeLogEntry {
         let mut stmt = conn.prepare(
             "SELECT * FROM change_log WHERE sync_pair_id = ?1 ORDER BY created_at DESC LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![sync_pair_id, limit], |row| {
-            Ok(Self {
-                id: Some(row.get("id")?),
-                sync_pair_id: row.get("sync_pair_id")?,
-                relative_path: row.get("relative_path")?,
-                action: row.get("action")?,
-                detail: row.get("detail")?,
-                created_at: row.get("created_at")?,
-            })
-        })?;
+        let rows = stmt.query_map(params![sync_pair_id, limit], |row| Self::from_row(row))?;
         let mut entries = Vec::new();
         for row in rows {
             entries.push(row?);
         }
         Ok(entries)
+    }
+
+    fn from_row(row: &rusqlite::Row) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: Some(row.get("id")?),
+            sync_pair_id: row.get("sync_pair_id")?,
+            relative_path: row.get("relative_path")?,
+            action: row.get("action")?,
+            detail: row.get("detail")?,
+            created_at: row.get("created_at")?,
+            bytes: row.get("bytes")?,
+            duration_ms: row.get("duration_ms")?,
+        })
+    }
+}
+
+// ── TransferStats ────────────────────────────────────────────────────
+
+/// One direction's totals over some window of the change log.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DirectionTotals {
+    /// Transfers logged, including ones from before byte accounting existed.
+    pub files: i64,
+    /// Bytes moved across the transfers that were measured.
+    pub bytes: i64,
+    /// Milliseconds spent on those same measured transfers. Dividing
+    /// `bytes` by this gives an average throughput that ignores the time
+    /// between transfers, which is the number a user reads as "my speed".
+    pub duration_ms: i64,
+    /// How many of `files` carry a byte measurement. When this is less than
+    /// `files`, the byte totals understate reality and the UI says so
+    /// rather than pretending the average is complete.
+    pub measured_files: i64,
+}
+
+impl DirectionTotals {
+    /// Average bytes/second across measured transfers, or `None` when
+    /// nothing measurable has happened yet.
+    pub fn average_bps(&self) -> Option<f64> {
+        if self.duration_ms <= 0 || self.bytes <= 0 {
+            return None;
+        }
+        Some((self.bytes as f64) * 1000.0 / (self.duration_ms as f64))
+    }
+}
+
+/// Aggregate transfer activity, for the statistics page.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TransferStats {
+    pub uploaded: DirectionTotals,
+    pub downloaded: DirectionTotals,
+    pub deleted: i64,
+    pub conflicts: i64,
+    pub errors: i64,
+    /// Timestamp of the oldest change-log row in the window — i.e. how far
+    /// back these numbers actually reach.
+    pub since: Option<String>,
+    pub last_activity: Option<String>,
+}
+
+impl TransferStats {
+    /// Totals for one sync pair, or across all pairs when `sync_pair_id` is
+    /// `None`. `since` restricts to rows at or after an SQLite datetime
+    /// expression (e.g. `datetime('now','-7 days')`).
+    pub fn compute(
+        conn: &Connection,
+        sync_pair_id: Option<&str>,
+        since: Option<&str>,
+    ) -> Result<Self> {
+        // created_at is written by SQLite's datetime('now') (UTC, no zone
+        // suffix), so string comparison against another datetime() value is
+        // a correct ordering — both are the same fixed-width format.
+        let mut sql = String::from(
+            "SELECT action, COUNT(*) AS n, \
+                    COALESCE(SUM(bytes), 0) AS total_bytes, \
+                    COALESCE(SUM(duration_ms), 0) AS total_ms, \
+                    SUM(CASE WHEN bytes IS NOT NULL THEN 1 ELSE 0 END) AS measured \
+             FROM change_log WHERE 1 = 1",
+        );
+        if sync_pair_id.is_some() {
+            sql.push_str(" AND sync_pair_id = :pair");
+        }
+        if since.is_some() {
+            sql.push_str(" AND created_at >= :since");
+        }
+        sql.push_str(" GROUP BY action");
+
+        let mut stats = Self::default();
+        {
+            let mut stmt = conn.prepare(&sql)?;
+            let mut params: Vec<(&str, &dyn rusqlite::ToSql)> = Vec::new();
+            if let Some(id) = sync_pair_id.as_ref() {
+                params.push((":pair", id));
+            }
+            if let Some(s) = since.as_ref() {
+                params.push((":since", s));
+            }
+            let rows = stmt.query_map(params.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>("action")?,
+                    row.get::<_, i64>("n")?,
+                    row.get::<_, i64>("total_bytes")?,
+                    row.get::<_, i64>("total_ms")?,
+                    row.get::<_, i64>("measured")?,
+                ))
+            })?;
+
+            for row in rows {
+                let (action, n, bytes, ms, measured) = row?;
+                let totals = DirectionTotals {
+                    files: n,
+                    bytes,
+                    duration_ms: ms,
+                    measured_files: measured,
+                };
+                match action.as_str() {
+                    "upload" => stats.uploaded = totals,
+                    "download" => stats.downloaded = totals,
+                    "delete-local" | "delete-remote" => stats.deleted += n,
+                    "conflict" => stats.conflicts += n,
+                    "error" => stats.errors += n,
+                    _ => {}
+                }
+            }
+        }
+
+        let mut range_sql =
+            String::from("SELECT MIN(created_at), MAX(created_at) FROM change_log WHERE 1 = 1");
+        if sync_pair_id.is_some() {
+            range_sql.push_str(" AND sync_pair_id = :pair");
+        }
+        if since.is_some() {
+            range_sql.push_str(" AND created_at >= :since");
+        }
+        let mut stmt = conn.prepare(&range_sql)?;
+        let mut params: Vec<(&str, &dyn rusqlite::ToSql)> = Vec::new();
+        if let Some(id) = sync_pair_id.as_ref() {
+            params.push((":pair", id));
+        }
+        if let Some(s) = since.as_ref() {
+            params.push((":since", s));
+        }
+        let (min, max) = stmt.query_row(params.as_slice(), |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        })?;
+        stats.since = min;
+        stats.last_activity = max;
+
+        Ok(stats)
     }
 }

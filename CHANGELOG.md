@@ -4,6 +4,29 @@ All notable changes to InSyncBee are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.5] — 2026-08-08
+
+### Added
+- **Transfer speeds in the activity feed.** Every upload and download row now
+  shows how big it was and how fast it went, and a live readout at the top of
+  the tab shows current up/down throughput while a sync is running, with a
+  count of files in flight in each direction.
+- **A statistics page.** Files and bytes uploaded and downloaded — all-time and
+  over the last 7 days — with average throughput, deletes/conflicts/errors, and
+  a per-sync-pair breakdown. Scope it to one pair or view every pair together.
+- Transfers are recorded with their size and duration (`change_log.bytes`,
+  `change_log.duration_ms`, schema v3). Rows written before this stay `NULL`
+  rather than being back-filled with a guess: they count as transfers, not as
+  zero-byte ones, and the statistics page reports how many are unmeasured
+  instead of averaging them in.
+
+### Fixed
+- **Downloads no longer buffer the entire file in memory.** They were read into
+  a single in-memory buffer before being written to disk, so a 4 GB download
+  needed 4 GB of RAM. They now stream to disk chunk by chunk — which is also
+  what makes download progress and speed observable at all; previously only
+  uploads reported progress.
+
 ## [0.2.4] — 2026-08-08
 
 ### Fixed

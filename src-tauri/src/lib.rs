@@ -2,10 +2,10 @@ use insyncbee_core::auth::{AuthManager, OAuthCredentials};
 use insyncbee_core::crypto::{self, FileCipher};
 use insyncbee_core::db::models::{
     Account, ChangeLogEntry, ConflictPolicy, FileEntry, FileState, SyncMode, SyncPair,
-    SyncPairStatus,
+    SyncPairStatus, TransferStats,
 };
 use insyncbee_core::db::Database;
-use insyncbee_core::drive::HttpDriveClient;
+use insyncbee_core::drive::{HttpDriveClient, TransferKind};
 use insyncbee_core::keystore;
 use std::sync::Arc;
 use tauri::Emitter;
@@ -67,6 +67,63 @@ fn get_conflicts(state: State<DbState>, sync_pair_id: String) -> Result<Vec<File
         FileEntry::list_by_state(conn, &sync_pair_id, &FileState::Conflict)
     })
     .map_err(|e| e.to_string())
+}
+
+/// Totals for the statistics page: one sync pair, or every pair when
+/// `sync_pair_id` is omitted. Returns all-time alongside the last 7 days so
+/// the page can show "lifetime" and "recent" without a second round-trip.
+#[tauri::command]
+fn get_transfer_stats(
+    state: State<DbState>,
+    sync_pair_id: Option<String>,
+) -> Result<StatsPayload, String> {
+    let s = state.lock().map_err(|e| e.to_string())?;
+    s.db.with_conn(|conn| {
+        Ok(StatsPayload {
+            all_time: TransferStats::compute(conn, sync_pair_id.as_deref(), None)?,
+            last_7_days: TransferStats::compute(
+                conn,
+                sync_pair_id.as_deref(),
+                Some("datetime('now','-7 days')"),
+            )?,
+        })
+    })
+    .map_err(|e| e.to_string())
+}
+
+/// Per-pair totals, so the statistics page can break the numbers down
+/// without one round-trip per sync pair.
+#[tauri::command]
+fn get_transfer_stats_by_pair(state: State<DbState>) -> Result<Vec<PairStats>, String> {
+    let s = state.lock().map_err(|e| e.to_string())?;
+    s.db.with_conn(|conn| {
+        let pairs = SyncPair::list(conn)?;
+        let mut out = Vec::with_capacity(pairs.len());
+        for pair in pairs {
+            out.push(PairStats {
+                stats: TransferStats::compute(conn, Some(&pair.id), None)?,
+                sync_pair_id: pair.id,
+                name: pair.name,
+            });
+        }
+        Ok(out)
+    })
+    .map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StatsPayload {
+    all_time: TransferStats,
+    last_7_days: TransferStats,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PairStats {
+    sync_pair_id: String,
+    name: String,
+    stats: TransferStats,
 }
 
 #[tauri::command]
@@ -290,19 +347,20 @@ async fn trigger_sync(
     let app_clone = app.clone();
     let pair_id_for_cb = sync_pair_id.clone();
     let progress_cb: insyncbee_core::drive::ProgressCallback = Arc::new(
-        move |local_path: &std::path::Path, bytes: u64, total: u64| {
+        move |local_path: &std::path::Path, kind: TransferKind, bytes: u64, total: u64| {
             let name = local_path
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| local_path.to_string_lossy().into_owned());
-            let payload = UploadProgress {
+            let payload = TransferProgress {
                 sync_pair_id: pair_id_for_cb.clone(),
+                kind: kind.as_str(),
                 name,
                 path: local_path.to_string_lossy().into_owned(),
                 bytes,
                 total,
             };
-            let _ = app_clone.emit("upload-progress", payload);
+            let _ = app_clone.emit("transfer-progress", payload);
         },
     );
 
@@ -327,8 +385,11 @@ async fn trigger_sync(
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct UploadProgress {
+struct TransferProgress {
     sync_pair_id: String,
+    /// "upload" or "download" — the frontend keys its live speed readouts
+    /// off this, so the two directions are never summed together.
+    kind: &'static str,
     name: String,
     path: String,
     bytes: u64,
@@ -797,6 +858,8 @@ pub fn run() {
             get_files,
             get_conflicts,
             get_recent_activity,
+            get_transfer_stats,
+            get_transfer_stats_by_pair,
             pause_sync_pair,
             resume_sync_pair,
             start_login,

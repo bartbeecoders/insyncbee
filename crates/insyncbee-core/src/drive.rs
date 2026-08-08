@@ -6,6 +6,7 @@
 //! `crates/insyncbee-core/tests/common/mod.rs`).
 
 use async_trait::async_trait;
+use futures_util::StreamExt as _;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -14,11 +15,33 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::auth::AuthManager;
 
-/// Called on every byte-progress update during a resumable upload.
-/// Arguments: the local file path, bytes uploaded so far, total bytes.
-/// Invoked once at the start with `0` and again after every successful
-/// chunk; the last call has `bytes_uploaded == total_bytes`.
-pub type ProgressCallback = Arc<dyn Fn(&Path, u64, u64) + Send + Sync>;
+/// Which way the bytes are moving. Speed readouts are meaningless without
+/// it — an upload and a download of the same file are two different
+/// numbers to a user on an asymmetric connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransferKind {
+    Upload,
+    Download,
+}
+
+impl TransferKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Upload => "upload",
+            Self::Download => "download",
+        }
+    }
+}
+
+/// Called on every byte-progress update during a transfer.
+/// Arguments: the local file path, the direction, bytes moved so far, total
+/// bytes. Invoked once at the start with `0` and again after every
+/// successful chunk; the last call has `bytes == total`.
+///
+/// `total` is 0 when the size isn't known up front — Drive does not always
+/// send `Content-Length` on a download.
+pub type ProgressCallback = Arc<dyn Fn(&Path, TransferKind, u64, u64) + Send + Sync>;
 
 const DRIVE_API: &str = "https://www.googleapis.com/drive/v3";
 const UPLOAD_API: &str = "https://www.googleapis.com/upload/drive/v3";
@@ -187,9 +210,27 @@ impl HttpDriveClient {
             tokio::fs::create_dir_all(parent).await?;
         }
 
+        // Stream chunk by chunk rather than `resp.bytes()`: buffering the
+        // whole response meant a 4 GB download needed 4 GB of RAM, and it
+        // left nothing to report progress from — downloads were invisible
+        // in the UI while uploads had a live bar.
+        let total = resp.content_length().unwrap_or(0);
         let mut file = tokio::fs::File::create(dest).await?;
-        let bytes = resp.bytes().await?;
-        file.write_all(&bytes).await?;
+        let mut downloaded: u64 = 0;
+
+        if let Some(cb) = &self.progress {
+            cb(dest, TransferKind::Download, 0, total);
+        }
+
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            file.write_all(&chunk).await?;
+            downloaded += chunk.len() as u64;
+            if let Some(cb) = &self.progress {
+                cb(dest, TransferKind::Download, downloaded, total.max(downloaded));
+            }
+        }
         file.flush().await?;
 
         Ok(())
@@ -354,7 +395,7 @@ impl HttpDriveClient {
         // Announce the upload at 0% so the UI can render a bar before the
         // first (potentially slow) chunk PUT completes.
         if let Some(cb) = &self.progress {
-            cb(local_path, 0, total_size);
+            cb(local_path, TransferKind::Upload, 0, total_size);
         }
 
         let mut file = tokio::fs::File::open(local_path).await?;
@@ -411,7 +452,7 @@ impl HttpDriveClient {
                     );
                 }
                 if let Some(cb) = &self.progress {
-                    cb(local_path, total_size, total_size);
+                    cb(local_path, TransferKind::Upload, total_size, total_size);
                 }
                 let file: DriveFile = resp.json().await?;
                 return Ok(file);
@@ -429,7 +470,7 @@ impl HttpDriveClient {
             }
             offset += filled as u64;
             if let Some(cb) = &self.progress {
-                cb(local_path, offset, total_size);
+                cb(local_path, TransferKind::Upload, offset, total_size);
             }
         }
     }

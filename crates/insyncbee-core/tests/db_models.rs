@@ -6,10 +6,16 @@
 mod common;
 
 use common::{test_db, test_db_with_account};
+use insyncbee_core::db::Database;
 use insyncbee_core::db::models::{
     Account, ChangeLogEntry, ConflictPolicy, FileEntry, FileState, SyncMode, SyncPair,
     SyncPairStatus,
 };
+
+/// The current schema version. Bump this in the same commit that adds a
+/// migration — a failure here means migrations and this constant disagree,
+/// which is exactly the check worth having.
+const EXPECTED_SCHEMA_VERSION: i64 = 3;
 
 #[test]
 fn migrations_run_on_open() {
@@ -24,7 +30,54 @@ fn migrations_run_on_open() {
             )?)
         })
         .unwrap();
-    assert_eq!(v, 2, "expected schema v2 after open_in_memory");
+    assert_eq!(
+        v, EXPECTED_SCHEMA_VERSION,
+        "expected schema v{EXPECTED_SCHEMA_VERSION} after open_in_memory"
+    );
+}
+
+/// A database created before v3 must gain the transfer columns on open,
+/// with existing rows reading as "not measured" rather than as zero bytes.
+#[test]
+fn v3_adds_transfer_columns_to_an_existing_database() {
+    use insyncbee_core::db::models::TransferStats;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy.db");
+
+    // Build a v2-era database by hand: schema_version says 2, and the
+    // change_log has no byte columns.
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
+             INSERT INTO schema_version (version) VALUES (1);
+             INSERT INTO schema_version (version) VALUES (2);
+             CREATE TABLE change_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sync_pair_id TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                action TEXT NOT NULL,
+                detail TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             INSERT INTO change_log (sync_pair_id, relative_path, action)
+                VALUES ('pair-1', 'old.txt', 'upload');",
+        )
+        .unwrap();
+    }
+
+    let db = Database::open(&path).unwrap();
+    let stats = db
+        .with_conn(|conn| TransferStats::compute(conn, Some("pair-1"), None))
+        .unwrap();
+
+    assert_eq!(stats.uploaded.files, 1, "the pre-existing row survives");
+    assert_eq!(
+        stats.uploaded.measured_files, 0,
+        "it must not claim to have a byte measurement"
+    );
+    assert_eq!(stats.uploaded.bytes, 0);
 }
 
 #[test]

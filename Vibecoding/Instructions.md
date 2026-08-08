@@ -10,3 +10,9 @@ App should give the user good feedback on issues and progress.
 
 Use Rust for the backend and frontend.
 
+
+
+Add the following improvments:
+
+- in the activity overview, show thhe upload and download speed
+- add a statistics page where we can see how many files/bytes have been uploaded/downloaded

@@ -4,10 +4,13 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import changelogMd from "../../CHANGELOG.md?raw";
 
-const APP_VERSION = "0.2.4";
+const APP_VERSION = "0.2.5";
 
-interface UploadProgress {
+type TransferKind = "upload" | "download";
+
+interface TransferProgress {
   syncPairId: string;
+  kind: TransferKind;
   name: string;
   path: string;
   bytes: number;
@@ -17,7 +20,7 @@ interface UploadProgress {
 // Augmented entry stored client-side. We snapshot the first event's
 // (time, bytes) so we can compute average speed and ETA from the deltas
 // — the backend doesn't send timing info, just current/total.
-interface UploadEntry extends UploadProgress {
+interface UploadEntry extends TransferProgress {
   startedAt: number;
   startedBytes: number;
   lastUpdatedAt: number;
@@ -74,9 +77,41 @@ interface ChangeLogEntry {
   action: string;
   detail: string | null;
   created_at: string;
+  // Null for non-transfer actions, and for transfers logged before
+  // byte accounting landed in schema v3.
+  bytes: number | null;
+  duration_ms: number | null;
 }
 
-type Tab = "dashboard" | "activity" | "conflicts" | "settings" | "about";
+interface DirectionTotals {
+  files: number;
+  bytes: number;
+  duration_ms: number;
+  measured_files: number;
+}
+
+interface TransferStats {
+  uploaded: DirectionTotals;
+  downloaded: DirectionTotals;
+  deleted: number;
+  conflicts: number;
+  errors: number;
+  since: string | null;
+  last_activity: string | null;
+}
+
+interface StatsPayload {
+  allTime: TransferStats;
+  last7Days: TransferStats;
+}
+
+interface PairStats {
+  syncPairId: string;
+  name: string;
+  stats: TransferStats;
+}
+
+type Tab = "dashboard" | "activity" | "statistics" | "conflicts" | "settings" | "about";
 
 function App() {
   const [tab, setTab] = createSignal<Tab>("dashboard");
@@ -91,7 +126,7 @@ function App() {
   const [uploads, setUploads] = createStore<UploadsByPair>({});
 
   onMount(() => {
-    const unlistenProgress = listen<UploadProgress>("upload-progress", (e) => {
+    const unlistenProgress = listen<TransferProgress>("transfer-progress", (e) => {
       const p = e.payload;
       const now = Date.now();
       setUploads(
@@ -166,6 +201,12 @@ function App() {
             Activity
           </button>
           <button
+            class={tab() === "statistics" ? "tab active" : "tab"}
+            onClick={() => setTab("statistics")}
+          >
+            Statistics
+          </button>
+          <button
             class={tab() === "conflicts" ? "tab active" : "tab"}
             onClick={() => setTab("conflicts")}
           >
@@ -197,7 +238,14 @@ function App() {
           />
         </Show>
         <Show when={tab() === "activity"}>
-          <ActivityFeed syncPairs={syncPairs() ?? []} selectedPair={selectedPair()} />
+          <ActivityFeed
+            syncPairs={syncPairs() ?? []}
+            selectedPair={selectedPair()}
+            uploads={uploads}
+          />
+        </Show>
+        <Show when={tab() === "statistics"}>
+          <StatisticsView syncPairs={syncPairs() ?? []} />
         </Show>
         <Show when={tab() === "conflicts"}>
           <ConflictsView
@@ -1507,16 +1555,56 @@ function DriveFolderPicker(props: {
   );
 }
 
-function ActivityFeed(props: { syncPairs: SyncPair[]; selectedPair: string | null }) {
+function ActivityFeed(props: {
+  syncPairs: SyncPair[];
+  selectedPair: string | null;
+  uploads: UploadsByPair;
+}) {
   const pairId = () => props.selectedPair ?? props.syncPairs[0]?.id;
 
-  const [activity] = createResource(pairId, async (id) => {
+  const [activity, { refetch }] = createResource(pairId, async (id) => {
     if (!id) return [];
     return await invoke<ChangeLogEntry[]>("get_recent_activity", {
       syncPairId: id,
       limit: 50,
     });
   });
+
+  // Refresh the feed when a sync ends so finished transfers (and their
+  // speeds) appear without switching tabs.
+  onMount(() => {
+    const unlisten = listen<string>("sync-finished", () => refetch());
+    onCleanup(() => unlisten.then((u) => u()));
+  });
+
+  // Live throughput: sum the per-file speeds of everything currently in
+  // flight for this pair, split by direction. Entries linger in the store
+  // until the sync finishes, so drop ones that stopped reporting — a
+  // finished file would otherwise keep inflating the current rate.
+  const STALE_MS = 3000;
+  const liveSpeed = (kind: TransferKind) => {
+    const id = pairId();
+    if (!id) return 0;
+    const now = Date.now();
+    return Object.values(props.uploads[id] ?? {})
+      .filter(
+        (t) =>
+          t.kind === kind &&
+          t.speedBps != null &&
+          t.bytes < t.total &&
+          now - t.lastUpdatedAt < STALE_MS,
+      )
+      .reduce((sum, t) => sum + (t.speedBps ?? 0), 0);
+  };
+  const activeCount = (kind: TransferKind) => {
+    const id = pairId();
+    if (!id) return 0;
+    const now = Date.now();
+    return Object.values(props.uploads[id] ?? {}).filter(
+      (t) => t.kind === kind && t.bytes < t.total && now - t.lastUpdatedAt < STALE_MS,
+    ).length;
+  };
+  const anyActive = () => activeCount("upload") + activeCount("download") > 0;
 
   const actionIcon = (action: string) => {
     switch (action) {
@@ -1533,7 +1621,27 @@ function ActivityFeed(props: { syncPairs: SyncPair[]; selectedPair: string | nul
 
   return (
     <div class="activity">
-      <h2>Recent Activity</h2>
+      <div class="activity-head">
+        <h2>Recent Activity</h2>
+        <div class="speed-readout" classList={{ idle: !anyActive() }}>
+          <div class="speed-item">
+            <span class="speed-arrow up">↑</span>
+            <span class="speed-value">{formatSpeed(liveSpeed("upload"))}</span>
+            <span class="speed-label">
+              {activeCount("upload") > 0 ? `${activeCount("upload")} uploading` : "idle"}
+            </span>
+          </div>
+          <div class="speed-item">
+            <span class="speed-arrow down">↓</span>
+            <span class="speed-value">{formatSpeed(liveSpeed("download"))}</span>
+            <span class="speed-label">
+              {activeCount("download") > 0
+                ? `${activeCount("download")} downloading`
+                : "idle"}
+            </span>
+          </div>
+        </div>
+      </div>
       <Show
         when={(activity() ?? []).length > 0}
         fallback={<p class="empty">No activity yet. Run a sync to see events here.</p>}
@@ -1552,11 +1660,223 @@ function ActivityFeed(props: { syncPairs: SyncPair[]; selectedPair: string | nul
                     {new Date(entry.created_at).toLocaleString()}
                   </div>
                 </div>
+                <Show when={entry.bytes != null}>
+                  <div class="activity-transfer">
+                    <span class="activity-size">{formatBytes(entry.bytes ?? 0)}</span>
+                    <Show when={entrySpeed(entry) != null}>
+                      <span class="activity-speed">
+                        {formatSpeed(entrySpeed(entry) ?? 0)}
+                      </span>
+                    </Show>
+                  </div>
+                </Show>
               </div>
             )}
           </For>
         </div>
       </Show>
+    </div>
+  );
+}
+
+/// Average speed of one completed transfer. Null when the row predates byte
+/// accounting, or when it isn't a transfer at all.
+function entrySpeed(entry: ChangeLogEntry): number | null {
+  if (entry.bytes == null || entry.duration_ms == null || entry.duration_ms <= 0) {
+    return null;
+  }
+  return (entry.bytes * 1000) / entry.duration_ms;
+}
+
+function formatSpeed(bytesPerSecond: number): string {
+  if (!bytesPerSecond || bytesPerSecond <= 0) return "—";
+  return `${formatBytes(Math.round(bytesPerSecond))}/s`;
+}
+
+function StatisticsView(props: { syncPairs: SyncPair[] }) {
+  const [scope, setScope] = createSignal<string>("all");
+
+  const scopeArg = () => (scope() === "all" ? undefined : scope());
+
+  const [stats, { refetch }] = createResource(scope, async () => {
+    return await invoke<StatsPayload>("get_transfer_stats", {
+      syncPairId: scopeArg() ?? null,
+    });
+  });
+
+  const [byPair] = createResource(async () => {
+    return await invoke<PairStats[]>("get_transfer_stats_by_pair");
+  });
+
+  onMount(() => {
+    const unlisten = listen<string>("sync-finished", () => refetch());
+    onCleanup(() => unlisten.then((u) => u()));
+  });
+
+  const totalBytes = (s: TransferStats | undefined) =>
+    (s?.uploaded.bytes ?? 0) + (s?.downloaded.bytes ?? 0);
+  const totalFiles = (s: TransferStats | undefined) =>
+    (s?.uploaded.files ?? 0) + (s?.downloaded.files ?? 0);
+
+  const avgSpeed = (d: DirectionTotals | undefined) => {
+    if (!d || d.duration_ms <= 0 || d.bytes <= 0) return null;
+    return (d.bytes * 1000) / d.duration_ms;
+  };
+
+  // Rows written before schema v3 have no byte measurement. Say so rather
+  // than letting a user read a total that silently excludes them.
+  const unmeasured = (s: TransferStats | undefined) =>
+    ((s?.uploaded.files ?? 0) - (s?.uploaded.measured_files ?? 0)) +
+    ((s?.downloaded.files ?? 0) - (s?.downloaded.measured_files ?? 0));
+
+  return (
+    <div class="statistics">
+      <div class="activity-head">
+        <h2>Statistics</h2>
+        <select
+          class="input input-sm"
+          value={scope()}
+          onChange={(e) => setScope(e.currentTarget.value)}
+        >
+          <option value="all">All sync pairs</option>
+          <For each={props.syncPairs}>
+            {(p) => <option value={p.id}>{p.name}</option>}
+          </For>
+        </select>
+      </div>
+
+      <Show
+        when={stats() && totalFiles(stats()?.allTime) > 0}
+        fallback={
+          <p class="empty">
+            Nothing transferred yet. Run a sync and the totals will show up here.
+          </p>
+        }
+      >
+        <div class="stat-grid">
+          <StatCard
+            title="Uploaded"
+            arrow="↑"
+            files={stats()!.allTime.uploaded.files}
+            bytes={stats()!.allTime.uploaded.bytes}
+            speed={avgSpeed(stats()!.allTime.uploaded)}
+          />
+          <StatCard
+            title="Downloaded"
+            arrow="↓"
+            files={stats()!.allTime.downloaded.files}
+            bytes={stats()!.allTime.downloaded.bytes}
+            speed={avgSpeed(stats()!.allTime.downloaded)}
+          />
+        </div>
+
+        <div class="stat-strip">
+          <div class="stat-chip">
+            <span class="stat-chip-value">{totalFiles(stats()?.allTime)}</span>
+            <span class="stat-chip-label">transfers</span>
+          </div>
+          <div class="stat-chip">
+            <span class="stat-chip-value">{formatBytes(totalBytes(stats()?.allTime))}</span>
+            <span class="stat-chip-label">moved</span>
+          </div>
+          <div class="stat-chip">
+            <span class="stat-chip-value">{stats()!.allTime.deleted}</span>
+            <span class="stat-chip-label">deletes</span>
+          </div>
+          <div class="stat-chip">
+            <span class="stat-chip-value">{stats()!.allTime.conflicts}</span>
+            <span class="stat-chip-label">conflicts</span>
+          </div>
+          <div class="stat-chip">
+            <span class="stat-chip-value">{stats()!.allTime.errors}</span>
+            <span class="stat-chip-label">errors</span>
+          </div>
+        </div>
+
+        <h3 class="stat-section">Last 7 days</h3>
+        <div class="stat-grid">
+          <StatCard
+            title="Uploaded"
+            arrow="↑"
+            files={stats()!.last7Days.uploaded.files}
+            bytes={stats()!.last7Days.uploaded.bytes}
+            speed={avgSpeed(stats()!.last7Days.uploaded)}
+          />
+          <StatCard
+            title="Downloaded"
+            arrow="↓"
+            files={stats()!.last7Days.downloaded.files}
+            bytes={stats()!.last7Days.downloaded.bytes}
+            speed={avgSpeed(stats()!.last7Days.downloaded)}
+          />
+        </div>
+
+        <Show when={scope() === "all" && (byPair() ?? []).length > 1}>
+          <h3 class="stat-section">By sync pair</h3>
+          <table class="stat-table">
+            <thead>
+              <tr>
+                <th>Sync pair</th>
+                <th>Uploaded</th>
+                <th>Downloaded</th>
+                <th>Total</th>
+              </tr>
+            </thead>
+            <tbody>
+              <For each={byPair()}>
+                {(row) => (
+                  <tr>
+                    <td>{row.name}</td>
+                    <td>
+                      {row.stats.uploaded.files} · {formatBytes(row.stats.uploaded.bytes)}
+                    </td>
+                    <td>
+                      {row.stats.downloaded.files} ·{" "}
+                      {formatBytes(row.stats.downloaded.bytes)}
+                    </td>
+                    <td>{formatBytes(totalBytes(row.stats))}</td>
+                  </tr>
+                )}
+              </For>
+            </tbody>
+          </table>
+        </Show>
+
+        <p class="stat-footnote">
+          <Show when={stats()!.allTime.since}>
+            Counting since{" "}
+            {new Date(stats()!.allTime.since as string).toLocaleString()}.{" "}
+          </Show>
+          <Show when={unmeasured(stats()?.allTime) > 0}>
+            {unmeasured(stats()?.allTime)} older transfer
+            {unmeasured(stats()?.allTime) === 1 ? "" : "s"} predate byte
+            accounting and count toward the file totals but not the byte totals.
+          </Show>
+        </p>
+      </Show>
+    </div>
+  );
+}
+
+function StatCard(props: {
+  title: string;
+  arrow: string;
+  files: number;
+  bytes: number;
+  speed: number | null;
+}) {
+  return (
+    <div class="stat-card">
+      <div class="stat-card-head">
+        <span class="stat-arrow">{props.arrow}</span>
+        <span class="stat-card-title">{props.title}</span>
+      </div>
+      <div class="stat-card-value">{formatBytes(props.bytes)}</div>
+      <div class="stat-card-meta">
+        {props.files} file{props.files === 1 ? "" : "s"}
+        {" · avg "}
+        {props.speed != null ? formatSpeed(props.speed) : "—"}
+      </div>
     </div>
   );
 }
