@@ -2,20 +2,20 @@ import { DEFAULT_RELEASES, githubReleaseUrl } from "../data/releases";
 
 const HIGHLIGHTS = [
   {
-    label: "Tray + autostart",
-    body: "Lives in the tray, optional start-on-login, headless --tray flag.",
+    label: "Conflicts converge",
+    body: "Resolutions are recorded, so Keep Both stops making a new copy every cycle.",
   },
   {
-    label: "Per-pair encryption",
-    body: "Client-side encryption with keys in the OS keyring.",
+    label: "Adopt existing folders",
+    body: "Files already on both sides are matched by checksum instead of conflicting.",
   },
   {
-    label: "Folder delete propagation",
-    body: "Deleting a folder locally now removes it from Drive instead of resurrecting it.",
+    label: "Hidden files stay hidden",
+    body: "Remote dot-files are ignored instead of being read as a local delete.",
   },
   {
-    label: "Nested upload fix",
-    body: "Parent IDs resolved at execute time so children land in the new folder.",
+    label: "Live e2e suite",
+    body: "Scenario catalogue tested against a real Drive account before every release.",
   },
 ];
 

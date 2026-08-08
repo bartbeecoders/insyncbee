@@ -4,6 +4,31 @@ All notable changes to InSyncBee are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] — 2026-08-08
+
+### Fixed
+- **Conflicts now converge** — resolving a conflict records the outcome as the
+  new base state. Previously every sync cycle recomputed the same conflict
+  from the same stale base: **Keep Both** created a new timestamped copy on
+  every poll interval, and the overwrite policies re-transferred the same file
+  forever. Conflicts where one side was deleted stay pending on purpose —
+  there is no base state for them that doesn't tell the next cycle to finish
+  the deletion.
+- **Adopting a folder that already has files no longer conflicts everything** —
+  the first-sync comparison hashed the local file with blake3 and compared it
+  against Drive's MD5, so identical files looked divergent and each got a
+  conflicted copy. That one cross-boundary comparison now uses MD5.
+- **Hidden files are ignored on both sides** — a remote dot-file was downloaded
+  and then skipped by the local scanner, so the next cycle read it as a local
+  deletion and trashed it on Drive.
+
+### Added
+- **Live end-to-end test harness** (`tests/e2e`) that runs against a real
+  Google Drive account, opt-in via `INSYNCBEE_E2E=1`, each scenario sandboxed
+  under `.insyncbee-e2e/` on both sides.
+- **`tests/SCENARIOS.md`** — the full scenario catalogue, marking what is
+  covered live, covered against the fake backend, manual, or a known gap.
+
 ## [0.2.0] — 2026-05-09
 
 ### Added
