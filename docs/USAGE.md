@@ -197,6 +197,17 @@ The GUI provides:
 - **Activity** — chronological feed of all sync events (uploads, downloads, folder creates, deletes, conflicts). Each transfer shows its size and the speed it achieved, and a live readout at the top shows current up/down throughput while a sync is running
 - **Statistics** — how many files and bytes have been uploaded and downloaded, all-time and over the last 7 days, with average throughput and a per-sync-pair breakdown
 - **Conflicts** — list of unresolved conflicts with resolution buttons (Keep Local / Keep Remote / Keep Both)
+- **Settings** — start on login, and **Sync automatically** (on by default)
+
+The app syncs in the background on its own: once at startup, immediately when
+local files change, and on each pair's poll interval for remote changes. Turn
+that off under Settings if you would rather sync only with the Sync Now button.
+Running `insyncbee daemon` as well is not needed — and not advised, since two
+processes syncing the same pair duplicate the work.
+
+Symlinks are not synced. Following them would recurse forever on a link to an
+ancestor and upload the same content twice on a link to a sibling tree, and
+Drive has nothing to map a symlink onto.
 
 Transfer sizes are recorded from the release that introduced them onward;
 syncs that ran before it still count as transfers but contribute no bytes, and

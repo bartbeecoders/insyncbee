@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import changelogMd from "../../CHANGELOG.md?raw";
 
-const APP_VERSION = "0.2.6";
+const APP_VERSION = "0.2.7";
 
 type TransferKind = "upload" | "download";
 
@@ -414,16 +414,32 @@ function renderInline(text: string): JSX.Element {
 
 function SettingsView() {
   const [autostart, setAutostart] = createSignal<boolean | null>(null);
+  const [autoSync, setAutoSync] = createSignal<boolean | null>(null);
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
 
   onMount(async () => {
     try {
       setAutostart(await invoke<boolean>("autostart_enabled"));
+      setAutoSync(await invoke<boolean>("get_auto_sync"));
     } catch (e) {
       setError(String(e));
     }
   });
+
+  async function toggleAutoSync() {
+    const next = !autoSync();
+    setBusy(true);
+    setError(null);
+    try {
+      await invoke("set_auto_sync", { enabled: next });
+      setAutoSync(next);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function toggle() {
     const next = !autostart();
@@ -443,6 +459,26 @@ function SettingsView() {
     <section class="section">
       <div class="section-header">
         <h2>Settings</h2>
+      </div>
+      <div class="settings-row">
+        <div>
+          <div class="settings-label">Sync automatically</div>
+          <div class="settings-help">
+            Keep sync pairs up to date in the background: an initial sync when
+            the app starts, immediately when local files change, and on each
+            pair's poll interval for changes made on Drive. Turn this off to
+            sync only when you press Sync Now.
+          </div>
+        </div>
+        <label class="toggle">
+          <input
+            type="checkbox"
+            checked={autoSync() === true}
+            disabled={autoSync() === null || busy()}
+            onChange={toggleAutoSync}
+          />
+          <span>{autoSync() ? "On" : "Off"}</span>
+        </label>
       </div>
       <div class="settings-row">
         <div>

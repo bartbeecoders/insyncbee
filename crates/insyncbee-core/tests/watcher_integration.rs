@@ -67,3 +67,56 @@ async fn watcher_emits_events_for_writes() {
     });
     assert!(saw_target, "expected a Created/Modified event for hello.txt, got {events:?}");
 }
+
+/// Symlinks are skipped, not misread as regular files.
+///
+/// `DirEntry::metadata()` does not follow links, so a symlink to a
+/// directory used to report `is_dir() == false`, get queued as a file
+/// upload, and fail with "Is a directory (os error 21)" on every single
+/// sync — hundreds of times over in a pnpm `node_modules` tree.
+#[cfg(unix)]
+#[test]
+fn scan_directory_skips_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+
+    std::fs::create_dir(root.join("real_dir")).unwrap();
+    std::fs::write(root.join("real_dir/inner.txt"), "hi").unwrap();
+    std::fs::write(root.join("real_file.txt"), "hi").unwrap();
+
+    symlink(root.join("real_dir"), root.join("link_to_dir")).unwrap();
+    symlink(root.join("real_file.txt"), root.join("link_to_file")).unwrap();
+
+    let entries = watcher::scan_directory(root).unwrap();
+    let paths: Vec<&str> = entries.iter().map(|e| e.relative_path.as_str()).collect();
+
+    assert!(paths.contains(&"real_dir"), "got: {paths:?}");
+    assert!(paths.contains(&"real_dir/inner.txt"), "got: {paths:?}");
+    assert!(paths.contains(&"real_file.txt"), "got: {paths:?}");
+    assert!(
+        !paths.iter().any(|p| p.starts_with("link_to_dir")),
+        "a symlinked directory must not be scanned or classified as a file: {paths:?}"
+    );
+    assert!(!paths.contains(&"link_to_file"), "got: {paths:?}");
+}
+
+/// A symlink pointing at an ancestor must not make the scan recurse
+/// forever — the reason we skip links rather than following them.
+#[cfg(unix)]
+#[test]
+fn scan_directory_terminates_on_a_symlink_loop() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir(root.join("sub")).unwrap();
+    symlink(root, root.join("sub/back_to_root")).unwrap();
+
+    let entries = watcher::scan_directory(root).unwrap();
+    assert!(
+        entries.iter().all(|e| !e.relative_path.contains("back_to_root")),
+        "the loop link should be skipped outright"
+    );
+}

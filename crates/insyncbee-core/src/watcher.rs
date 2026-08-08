@@ -171,6 +171,25 @@ fn scan_recursive(root: &Path, current: &Path, results: &mut Vec<LocalFileInfo>)
             continue;
         }
 
+        // Skip symlinks entirely.
+        //
+        // `entry.metadata()` does not follow links, so a symlink pointing
+        // at a directory reported `is_dir() == false` and got classified
+        // as a regular file. The upload then failed with
+        // "Is a directory (os error 21)" on every cycle — a pnpm
+        // node_modules tree, which is almost entirely such links,
+        // produced hundreds of errors per sync.
+        //
+        // Following them instead is not the fix: a link into an ancestor
+        // makes the scan recurse forever, and a link to a sibling tree
+        // silently uploads the same content twice. Drive has no concept
+        // to map a symlink onto, so the honest behaviour is to leave them
+        // alone and say so in the log.
+        if entry.file_type()?.is_symlink() {
+            tracing::debug!("Skipping symlink: {}", path.display());
+            continue;
+        }
+
         let relative = path
             .strip_prefix(root)
             .unwrap_or(&path)

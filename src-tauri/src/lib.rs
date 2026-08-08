@@ -326,26 +326,87 @@ async fn resolve_conflict(
 async fn trigger_sync(
     app: tauri::AppHandle,
     state: State<'_, DbState>,
+    inflight: State<'_, InFlight>,
     sync_pair_id: String,
 ) -> Result<String, String> {
-    let (db, creds) = {
+    let (db, credentials_path) = {
         let s = state.lock().map_err(|e| e.to_string())?;
-        let creds = OAuthCredentials::load(&s.credentials_path).map_err(|e| e.to_string())?;
-        (s.db.clone(), creds)
+        (s.db.clone(), s.credentials_path.clone())
     };
 
+    match run_sync(&app, &db, &credentials_path, &sync_pair_id, &inflight.0).await {
+        SyncOutcome::Done(report) => Ok(report),
+        SyncOutcome::AlreadyRunning => {
+            Ok("A sync is already running for this pair.".to_string())
+        }
+        SyncOutcome::Failed(e) => Err(e),
+    }
+}
+
+enum SyncOutcome {
+    Done(String),
+    /// Another sync for this pair is mid-flight. Two engines on one pair
+    /// race each other into duplicate uploads and phantom conflicts, so
+    /// the second caller backs off instead.
+    AlreadyRunning,
+    Failed(String),
+}
+
+/// Sync one pair, emitting the progress/status/finished events the UI
+/// listens for. Shared by the Sync Now button and the background loop so
+/// both produce identical feedback and honour the same in-flight guard.
+async fn run_sync(
+    app: &tauri::AppHandle,
+    db: &Database,
+    credentials_path: &Path,
+    sync_pair_id: &str,
+    inflight: &InFlightSet,
+) -> SyncOutcome {
+    // Claim the pair, or bail if someone else holds it.
+    {
+        let mut set = match inflight.lock() {
+            Ok(s) => s,
+            Err(e) => return SyncOutcome::Failed(e.to_string()),
+        };
+        if !set.insert(sync_pair_id.to_string()) {
+            return SyncOutcome::AlreadyRunning;
+        }
+    }
+
+    let result = run_sync_inner(app, db, credentials_path, sync_pair_id).await;
+
+    if let Ok(mut set) = inflight.lock() {
+        set.remove(sync_pair_id);
+    }
+    // Always tell the UI the pair is done, including on failure — otherwise
+    // its activity indicator spins forever on a sync that already died.
+    let _ = app.emit("sync-finished", sync_pair_id);
+
+    match result {
+        Ok(report) => SyncOutcome::Done(report),
+        Err(e) => SyncOutcome::Failed(e),
+    }
+}
+
+async fn run_sync_inner(
+    app: &tauri::AppHandle,
+    db: &Database,
+    credentials_path: &Path,
+    sync_pair_id: &str,
+) -> Result<String, String> {
+    let creds = OAuthCredentials::load(credentials_path).map_err(|e| e.to_string())?;
+
     let pair = db
-        .with_conn(|conn| SyncPair::get_by_id(conn, &sync_pair_id))
+        .with_conn(|conn| SyncPair::get_by_id(conn, sync_pair_id))
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Sync pair not found: {sync_pair_id}"))?;
 
     let auth = AuthManager::new(creds, db.clone());
 
-    // Build a progress callback that bridges the drive client's per-chunk
-    // updates into Tauri events the frontend can listen for. Cloning the
-    // AppHandle is cheap (it's just an Arc internally).
+    // Bridge the drive client's per-chunk updates into Tauri events the
+    // frontend can listen for. Cloning the AppHandle is cheap (an Arc).
     let app_clone = app.clone();
-    let pair_id_for_cb = sync_pair_id.clone();
+    let pair_id_for_cb = sync_pair_id.to_string();
     let progress_cb: insyncbee_core::drive::ProgressCallback = Arc::new(
         move |local_path: &std::path::Path, kind: TransferKind, bytes: u64, total: u64| {
             let name = local_path
@@ -371,7 +432,7 @@ async fn trigger_sync(
     // pair, and folder work never moves bytes, so without this the
     // dashboard has nothing to show for large stretches of a real sync.
     let app_for_status = app.clone();
-    let pair_id_for_status = sync_pair_id.clone();
+    let pair_id_for_status = sync_pair_id.to_string();
     let status_cb: insyncbee_core::sync_engine::StatusCallback =
         Arc::new(move |status: SyncStatus| {
             let _ = app_for_status.emit(
@@ -383,7 +444,7 @@ async fn trigger_sync(
             );
         });
 
-    let mut engine = SyncEngine::new(db, pair.clone()).with_status_callback(status_cb);
+    let mut engine = SyncEngine::new(db.clone(), pair.clone()).with_status_callback(status_cb);
     if pair.encryption_enabled {
         let cipher = keystore::load_cipher(&pair.id)
             .map_err(|e| e.to_string())?
@@ -396,8 +457,191 @@ async fn trigger_sync(
     }
 
     let report = engine.sync(&drive).await.map_err(|e| e.to_string())?;
-    let _ = app.emit("sync-finished", &sync_pair_id);
     Ok(report.to_string())
+}
+
+/// User settings that live next to the credentials, in
+/// `~/.config/insyncbee/settings.json`.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct AppSettings {
+    /// Sync automatically in the background. On by default: an app that
+    /// only syncs when you press a button is not a sync app.
+    auto_sync: bool,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self { auto_sync: true }
+    }
+}
+
+/// Settings live beside `credentials.json`, so the path is derived from it
+/// rather than re-deriving the config dir in two places.
+fn settings_path(credentials_path: &Path) -> PathBuf {
+    credentials_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("settings.json")
+}
+
+fn load_settings(credentials_path: &Path) -> AppSettings {
+    std::fs::read_to_string(settings_path(credentials_path))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        // A missing or corrupt file must not disable syncing — fall back
+        // to the default rather than leaving the app silently idle.
+        .unwrap_or_default()
+}
+
+fn auto_sync_enabled(credentials_path: &Path) -> bool {
+    load_settings(credentials_path).auto_sync
+}
+
+#[tauri::command]
+fn get_auto_sync(state: State<DbState>) -> Result<bool, String> {
+    let s = state.lock().map_err(|e| e.to_string())?;
+    Ok(auto_sync_enabled(&s.credentials_path))
+}
+
+#[tauri::command]
+fn set_auto_sync(state: State<DbState>, enabled: bool) -> Result<(), String> {
+    let s = state.lock().map_err(|e| e.to_string())?;
+    let path = settings_path(&s.credentials_path);
+    let settings = AppSettings { auto_sync: enabled };
+    let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(&path, json).map_err(|e| e.to_string())
+}
+
+/// Pairs with a sync in flight right now, shared by the button and the
+/// background loop.
+type InFlightSet = Arc<Mutex<std::collections::HashSet<String>>>;
+struct InFlight(InFlightSet);
+
+/// Background auto-sync: the reason the desktop app syncs at all without
+/// someone pressing a button.
+///
+/// The CLI has always done this (`insyncbee daemon`), but the GUI never
+/// did — it only ever synced a pair when its Sync Now button was clicked,
+/// so an app left open sat idle while Drive and disk drifted apart.
+///
+/// Mirrors the daemon's behaviour: an initial pass at startup, a
+/// filesystem watcher per pair for immediate local changes, and a poll at
+/// each pair's `poll_interval_secs` to pick up remote ones.
+fn spawn_auto_sync(
+    app: tauri::AppHandle,
+    db: Database,
+    credentials_path: PathBuf,
+    inflight: InFlightSet,
+) {
+    tauri::async_runtime::spawn(async move {
+        use insyncbee_core::watcher::FileWatcher;
+        use std::collections::HashMap;
+        use tokio::time::{Duration, Instant};
+
+        // Keyed by pair id. Watchers must be kept alive — dropping one
+        // silently stops the notifications.
+        let mut watchers: HashMap<String, (FileWatcher, _)> = HashMap::new();
+        let mut last_sync: HashMap<String, Instant> = HashMap::new();
+        let mut ticker = tokio::time::interval(Duration::from_secs(5));
+
+        loop {
+            ticker.tick().await;
+
+            if !auto_sync_enabled(&credentials_path) {
+                continue;
+            }
+
+            // Re-read every tick so pairs added, edited, paused, or
+            // deleted in the UI take effect without a restart.
+            let pairs = match db.with_conn(|conn| SyncPair::list(conn)) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!("auto-sync: could not list sync pairs: {e}");
+                    continue;
+                }
+            };
+            let active: Vec<SyncPair> = pairs
+                .into_iter()
+                .filter(|p| p.status == SyncPairStatus::Active)
+                .collect();
+
+            // Drop watchers for pairs that are gone or paused.
+            let active_ids: std::collections::HashSet<&str> =
+                active.iter().map(|p| p.id.as_str()).collect();
+            watchers.retain(|id, _| active_ids.contains(id.as_str()));
+
+            for pair in &active {
+                // Start watching a pair the first time we see it active.
+                if !watchers.contains_key(&pair.id) {
+                    let root = PathBuf::from(&pair.local_root);
+                    if root.exists() {
+                        match FileWatcher::start(&root, 2000) {
+                            Ok((w, rx)) => {
+                                tracing::info!("auto-sync: watching '{}'", pair.name);
+                                watchers.insert(pair.id.clone(), (w, rx));
+                            }
+                            Err(e) => {
+                                tracing::warn!("auto-sync: cannot watch '{}': {e}", pair.name)
+                            }
+                        }
+                    }
+                }
+
+                // A local change syncs immediately; otherwise wait out the
+                // pair's poll interval. A pair we've never synced in this
+                // session syncs right away — that's the startup pass.
+                let mut local_changed = false;
+                if let Some((_, rx)) = watchers.get_mut(&pair.id) {
+                    while let Ok(events) = rx.try_recv() {
+                        if !events.is_empty() {
+                            local_changed = true;
+                        }
+                    }
+                }
+
+                let due = match last_sync.get(&pair.id) {
+                    None => true,
+                    Some(t) => {
+                        Instant::now().duration_since(*t)
+                            >= Duration::from_secs(pair.poll_interval_secs.max(5) as u64)
+                    }
+                };
+
+                if !(local_changed || due) {
+                    continue;
+                }
+
+                // An encrypted pair whose key isn't in the keyring cannot
+                // sync. Skip quietly rather than failing every file every
+                // interval and burying the activity feed in errors — the
+                // user unlocks it from the dashboard.
+                if pair.encryption_enabled {
+                    match keystore::load_cipher(&pair.id) {
+                        Ok(Some(_)) => {}
+                        _ => {
+                            last_sync.insert(pair.id.clone(), Instant::now());
+                            continue;
+                        }
+                    }
+                }
+
+                last_sync.insert(pair.id.clone(), Instant::now());
+                match run_sync(&app, &db, &credentials_path, &pair.id, &inflight).await {
+                    SyncOutcome::Done(report) => {
+                        tracing::debug!("auto-sync '{}': {report}", pair.name);
+                    }
+                    SyncOutcome::AlreadyRunning => {}
+                    SyncOutcome::Failed(e) => {
+                        tracing::warn!("auto-sync '{}' failed: {e}", pair.name);
+                    }
+                }
+            }
+        }
+    });
 }
 
 #[derive(Serialize, Clone)]
@@ -788,9 +1032,12 @@ pub fn run() {
     let db = Database::open(&paths.db_path).expect("Failed to open database");
 
     let app_state = AppState {
-        db,
+        db: db.clone(),
         credentials_path: paths.credentials_path.clone(),
     };
+    let inflight: InFlightSet = Arc::new(Mutex::new(std::collections::HashSet::new()));
+    let inflight_for_loop = Arc::clone(&inflight);
+    let credentials_for_loop = paths.credentials_path.clone();
 
     let start_in_tray = std::env::args()
         .any(|a| a == "--tray" || a == "--background" || a == "--hidden");
@@ -810,6 +1057,14 @@ pub fn run() {
                         .build(),
                 )?;
             }
+
+            // Start syncing without waiting for a button press.
+            spawn_auto_sync(
+                app.handle().clone(),
+                db.clone(),
+                credentials_for_loop.clone(),
+                Arc::clone(&inflight_for_loop),
+            );
 
             let show_item =
                 MenuItem::with_id(app, "show", "Open InSyncBee", true, None::<&str>)?;
@@ -875,6 +1130,7 @@ pub fn run() {
             }
         })
         .manage(Mutex::new(app_state))
+        .manage(InFlight(inflight))
         .invoke_handler(tauri::generate_handler![
             list_accounts,
             list_sync_pairs,
@@ -882,6 +1138,8 @@ pub fn run() {
             get_files,
             get_conflicts,
             get_recent_activity,
+            get_auto_sync,
+            set_auto_sync,
             get_transfer_stats,
             get_transfer_stats_by_pair,
             pause_sync_pair,

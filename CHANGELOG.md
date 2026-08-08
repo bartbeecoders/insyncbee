@@ -4,6 +4,31 @@ All notable changes to InSyncBee are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.7] — 2026-08-08
+
+### Added
+- **The desktop app syncs on its own.** It never did: a pair only synced when
+  its Sync Now button was clicked, so an app left open sat idle while disk and
+  Drive drifted apart. Only the CLI (`insyncbee daemon`) had this behaviour.
+  The app now does an initial sync at startup, syncs immediately when local
+  files change, and polls each pair on its configured interval — with the
+  dashboard indicator showing it happen.
+- **Settings → Sync automatically**, on by default, for anyone who wants
+  manual-only syncing.
+- Manual and automatic syncs share an in-flight guard, so pressing Sync Now
+  during a background sync no longer runs two engines over one pair — which
+  raced into duplicate uploads and phantom conflicts.
+
+### Fixed
+- **Symlinks are skipped instead of failing.** `DirEntry::metadata()` does not
+  follow links, so a symlink pointing at a directory reported itself as a
+  regular file, got queued as an upload, and failed with "Is a directory
+  (os error 21)". A pnpm `node_modules` tree is almost entirely such links —
+  one real sync pair here logged 377 of these errors. Following them is not
+  the fix (a link to an ancestor recurses forever, a link to a sibling tree
+  uploads the same content twice, and Drive has nothing to map a symlink onto),
+  so they are now left alone and noted in the log.
+
 ## [0.2.6] — 2026-08-08
 
 ### Added
