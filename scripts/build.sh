@@ -13,7 +13,7 @@ cd "$PROJECT_DIR"
 echo ""
 echo "--- Building CLI (insyncbee-daemon) ---"
 cargo build --release --package insyncbee-daemon
-echo "CLI binary: target/release/insyncbee-daemon"
+echo "CLI binary: target/release/insyncbee"
 
 # Build GUI
 echo ""
@@ -21,4 +21,5 @@ echo "--- Building GUI (Tauri app) ---"
 cargo tauri build
 echo ""
 echo "=== Build complete ==="
-echo "Bundles are in: src-tauri/target/release/bundle/"
+# One target dir for the whole workspace, so bundles are NOT under src-tauri/.
+echo "Bundles are in: target/release/bundle/"

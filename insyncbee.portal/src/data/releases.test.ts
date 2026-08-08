@@ -6,28 +6,42 @@ import {
   detectOs,
   downloadUrl,
   githubReleaseUrl,
+  productById,
   type Artifact,
   type Releases,
 } from "./releases";
 
 const sample: Artifact = {
   kind: "tar.gz",
+  product: "insyncbee-db-service",
   label: "Linux x86_64 (tar.gz)",
   arch: "x86_64",
   osLabel: "linux-x86_64",
 };
 
+const allArtifacts = () =>
+  DEFAULT_RELEASES.products.flatMap((p) =>
+    p.platforms.flatMap((pl) => pl.artifacts),
+  );
+
 describe("artifactFilename", () => {
   it("composes <product>-<version>-<osLabel>.<kind>", () => {
     expect(artifactFilename(sample)).toBe(
-      `${DEFAULT_RELEASES.product}-${DEFAULT_RELEASES.version}-linux-x86_64.tar.gz`,
+      `insyncbee-db-service-${DEFAULT_RELEASES.version}-linux-x86_64.tar.gz`,
     );
   });
 
   it("uses the supplied release for version interpolation", () => {
     const release: Releases = { ...DEFAULT_RELEASES, version: "9.9.9" };
     expect(artifactFilename(sample, release)).toBe(
-      `${release.product}-9.9.9-linux-x86_64.tar.gz`,
+      "insyncbee-db-service-9.9.9-linux-x86_64.tar.gz",
+    );
+  });
+
+  it("keeps the two products in separate filename namespaces", () => {
+    const desktop: Artifact = { ...sample, product: "insyncbee-desktop", kind: "AppImage" };
+    expect(artifactFilename(desktop)).toBe(
+      `insyncbee-desktop-${DEFAULT_RELEASES.version}-linux-x86_64.AppImage`,
     );
   });
 
@@ -35,10 +49,12 @@ describe("artifactFilename", () => {
     ["linux-x86_64", "tar.gz"] as const,
     ["macos-aarch64", "tar.gz"] as const,
     ["windows-x86_64", "zip"] as const,
+    ["linux-x86_64", "AppImage"] as const,
+    ["linux-x86_64", "deb"] as const,
+    ["linux-x86_64", "rpm"] as const,
   ])("matches the CI matrix label %s with extension .%s", (osLabel, kind) => {
-    const a: Artifact = { osLabel, kind, arch: "x86_64", label: "" };
-    const fn = artifactFilename(a);
-    expect(fn).toMatch(new RegExp(`-${osLabel}\\.${kind}$`));
+    const a: Artifact = { osLabel, kind, product: "insyncbee-x", arch: "x86_64", label: "" };
+    expect(artifactFilename(a)).toMatch(new RegExp(`-${osLabel}\\.${kind}$`));
   });
 });
 
@@ -50,7 +66,9 @@ describe("downloadUrl", () => {
   });
 
   it("does NOT escape upward (no ..)", () => {
-    expect(downloadUrl(sample)).not.toContain("..");
+    for (const a of allArtifacts()) {
+      expect(downloadUrl(a)).not.toContain("..");
+    }
   });
 });
 
@@ -62,10 +80,16 @@ describe("checksumUrl", () => {
 
 describe("githubReleaseUrl", () => {
   it("points at the v<version> release page on the configured repo", () => {
-    const u = githubReleaseUrl();
-    expect(u).toBe(
+    expect(githubReleaseUrl()).toBe(
       `https://github.com/${DEFAULT_RELEASES.repo}/releases/tag/v${DEFAULT_RELEASES.version}`,
     );
+  });
+});
+
+describe("productById", () => {
+  it("finds both shipped products", () => {
+    expect(productById("desktop")?.displayName).toBe("Desktop app");
+    expect(productById("db-service")?.displayName).toBe("db-service");
   });
 });
 
@@ -99,17 +123,30 @@ describe("detectOs", () => {
 });
 
 describe("DEFAULT_RELEASES manifest invariants", () => {
-  it("covers all three target platforms", () => {
-    const oss = DEFAULT_RELEASES.platforms.map((p) => p.os).sort();
+  it("ships the desktop app and the db-service", () => {
+    expect(DEFAULT_RELEASES.products.map((p) => p.id).sort()).toEqual([
+      "db-service",
+      "desktop",
+    ]);
+  });
+
+  it("covers all three target platforms with the db-service", () => {
+    const oss = productById("db-service")!.platforms.map((p) => p.os).sort();
     expect(oss).toEqual(["linux", "mac", "windows"]);
   });
 
-  it("every artifact has a matching osLabel produced by the CI matrix", () => {
-    const allowed = new Set(["linux-x86_64", "macos-aarch64", "windows-x86_64"]);
-    for (const p of DEFAULT_RELEASES.platforms) {
-      for (const a of p.artifacts) {
-        expect(allowed.has(a.osLabel)).toBe(true);
-      }
+  // The desktop bundles are Linux-only until macOS/Windows signing exists —
+  // publishing an unsigned .app or .msi would be worse than not shipping one.
+  it("ships desktop bundles for Linux only", () => {
+    expect(productById("desktop")!.platforms.map((p) => p.os)).toEqual(["linux"]);
+  });
+
+  it("every artifact has an osLabel and product produced by the CI matrix", () => {
+    const labels = new Set(["linux-x86_64", "macos-aarch64", "windows-x86_64"]);
+    const products = new Set(["insyncbee-db-service", "insyncbee-desktop"]);
+    for (const a of allArtifacts()) {
+      expect(labels.has(a.osLabel)).toBe(true);
+      expect(products.has(a.product)).toBe(true);
     }
   });
 

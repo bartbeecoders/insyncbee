@@ -19,7 +19,10 @@ cd "$ROOT_DIR"
 
 VPS_IP="${VPS_IP:-212.47.77.32}"
 VPS_USER="${VPS_USER:-bart}"
-VERSION="${1:-$(grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' releases.json | head -1 | sed 's/.*"\([^"]*\)"$/\1/')}"
+# Version comes from the portal's package.json — the same file the release
+# workflow reads on a manual dispatch. (This used to grep a root releases.json
+# that does not exist, so VERSION always came out empty.)
+VERSION="${1:-$(grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' insyncbee.portal/package.json | head -1 | sed 's/.*"\([^"]*\)"$/\1/')}"
 
 LOCAL_DIR="releases/$VERSION"
 REMOTE_DIR="/srv/insyncbee/releases"

@@ -1,6 +1,27 @@
 # InSyncBee Usage Guide
 
-## Prerequisites
+## Installing
+
+Two things are published for each release, and they are not interchangeable:
+
+| Download | What it is |
+|---|---|
+| `insyncbee-desktop-<version>-linux-x86_64.{AppImage,deb,rpm}` | The **desktop app** — window, tray icon, conflict resolution UI. Linux x86_64. |
+| `insyncbee-db-service-<version>-<platform>.{tar.gz,zip}` | The **headless service** — `insyncbee` CLI + daemon, no UI. Linux, macOS, Windows. |
+
+Grab either from [insyncbee.dev](https://insyncbee.dev/#download) or the
+[GitHub Releases page](https://github.com/bartbeecoders/insyncbee/releases).
+
+On Linux the tray icon needs an AppIndicator library present — install
+`libayatana-appindicator3-1` (Debian/Ubuntu), `libappindicator-gtk3` (Fedora),
+or `libayatana-appindicator` (Arch/EndeavourOS). Without it the app still runs,
+but it starts with no tray icon.
+
+macOS and Windows desktop bundles are not published yet: unsigned bundles are
+blocked by Gatekeeper and SmartScreen, and signing needs certificates that
+aren't wired into the pipeline. Build from source on those platforms for now.
+
+## Prerequisites (building from source)
 
 - **Rust** (1.77.2+) — [rustup.rs](https://rustup.rs)
 - **pnpm** — `npm install -g pnpm`
@@ -161,8 +182,10 @@ The GUI provides:
 ```
 
 This produces:
-- CLI binary: `target/release/insyncbee-daemon`
-- GUI bundles: `src-tauri/target/release/bundle/` (`.deb`, `.AppImage`, etc.)
+- CLI binary: `target/release/insyncbee` (the crate is `insyncbee-daemon`, the
+  binary it builds is `insyncbee`)
+- GUI bundles: `target/release/bundle/` (`.deb`, `.rpm`, `.AppImage`) — the
+  workspace shares one target directory, so they are not under `src-tauri/`
 
 ## Data Location
 

@@ -13,8 +13,8 @@ export default function Hero() {
           </h1>
           <p className="hero-tagline">
             InSyncBee syncs your Drive like it should: block-level deltas, real
-            conflict resolution, zero data loss. Linux, macOS, Windows — one
-            honest binary, no subscriptions.
+            conflict resolution, zero data loss. A desktop app with a tray icon,
+            or the same engine headless — no subscriptions.
           </p>
           <div className="hero-cta-row">
             <a className="btn btn-primary btn-lg" href="#download">

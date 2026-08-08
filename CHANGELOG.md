@@ -4,6 +4,30 @@ All notable changes to InSyncBee are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] — 2026-08-08
+
+### Added
+- **The desktop app is now a download.** Every release builds the Tauri app —
+  the one with the window and the tray icon — for Linux x86_64 and publishes
+  it as `.AppImage`, `.deb`, and `.rpm` with checksums. Until now the only
+  published artifact was the headless db-service, so there was no way to get
+  the UI without building it yourself.
+- **The download page offers both products**, with the desktop app first and
+  the db-service described for what it is: the same sync engine with no UI,
+  for servers and headless boxes.
+
+### Fixed
+- `docs/USAGE.md` and `scripts/build.sh` pointed at `target/release/insyncbee-daemon`
+  and `src-tauri/target/release/bundle/`. The binary is `target/release/insyncbee`
+  and, because the workspace shares one target dir, bundles land in
+  `target/release/bundle/`.
+- `scripts/upload-release.sh` read its version from a `releases.json` that does
+  not exist at the repo root, so `VERSION` was always empty.
+
+### Removed
+- `insyncbee.portal/releases.json` — an unused duplicate of `src/data/releases.ts`
+  that still advertised an Intel Mac build the pipeline no longer produces.
+
 ## [0.2.1] — 2026-08-08
 
 ### Fixed

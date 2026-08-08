@@ -440,9 +440,21 @@ h3 {
   font-size: 14px;
 }
 
+/* Each product gets its own block: the desktop app first, then db-service. */
+.product-block { margin-top: 34px; }
+.product-head { margin-bottom: 14px; }
+.product-head h3 { font-size: 20px; margin-bottom: 4px; }
+.product-tagline {
+  color: var(--text-dim);
+  font-size: 14px;
+  max-width: 70ch;
+}
+
+/* auto-fit rather than a fixed 3 columns: the desktop app currently ships one
+   platform, and a lone card in a third of the row looks broken. */
 .download-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
   gap: 14px;
 }
 @media (max-width: 760px) { .download-grid { grid-template-columns: 1fr; } }
@@ -464,7 +476,7 @@ h3 {
   color: var(--accent);
   flex-shrink: 0;
 }
-.download-card h3 { font-size: 16px; margin-bottom: 2px; }
+.download-card h4 { font-size: 16px; margin-bottom: 2px; }
 .download-card .os-meta {
   color: var(--text-dim);
   font-size: 12px;

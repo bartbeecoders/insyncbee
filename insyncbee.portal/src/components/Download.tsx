@@ -4,8 +4,11 @@ import {
   detectOs,
   downloadUrl,
   githubReleaseUrl,
+  productById,
+  type Artifact,
   type OsKey,
   type PlatformRelease,
+  type ProductRelease,
 } from "../data/releases";
 
 const OS_ICONS: Record<OsKey, React.ReactNode> = {
@@ -33,15 +36,11 @@ function PlatformCard({ platform }: { platform: PlatformRelease }) {
     <div className="download-card">
       <div className="os-icon" aria-hidden="true">{OS_ICONS[platform.os]}</div>
       <div style={{ flex: 1 }}>
-        <h3>{platform.displayName}</h3>
+        <h4>{platform.displayName}</h4>
         <div className="os-meta">{platform.requirement}</div>
         <div className="artifact-list">
           {platform.artifacts.map((a) => (
-            <a
-              key={a.osLabel}
-              href={downloadUrl(a)}
-              download
-            >
+            <a key={`${a.product}-${a.osLabel}-${a.kind}`} href={downloadUrl(a)} download>
               {a.label} <code>{a.arch}</code>
             </a>
           ))}
@@ -51,38 +50,67 @@ function PlatformCard({ platform }: { platform: PlatformRelease }) {
   );
 }
 
-export default function Download() {
-  const detected: OsKey | null = useMemo(() => detectOs(), []);
-  const recommended = useMemo(
-    () =>
-      detected
-        ? DEFAULT_RELEASES.platforms.find((p) => p.os === detected)
-        : undefined,
-    [detected],
+function ProductBlock({ product }: { product: ProductRelease }) {
+  return (
+    <div className="product-block" id={`download-${product.id}`}>
+      <div className="product-head">
+        <h3>{product.displayName}</h3>
+        <p className="product-tagline">{product.tagline}</p>
+      </div>
+      <div className="download-grid">
+        {product.platforms.map((p) => (
+          <PlatformCard key={p.os} platform={p} />
+        ))}
+      </div>
+    </div>
   );
+}
 
-  const topArtifact = recommended?.artifacts[0];
+// What the big button offers: the desktop app for the visitor's OS when we
+// build one for it, otherwise the db-service. Never nothing — an unrecognised
+// OS still gets the Linux desktop build offered below.
+function recommend(
+  os: OsKey | null,
+): { product: ProductRelease; platform: PlatformRelease; artifact: Artifact } | undefined {
+  if (!os) return undefined;
+  for (const id of ["desktop", "db-service"] as const) {
+    const product = productById(id);
+    const platform = product?.platforms.find((p) => p.os === os);
+    const artifact = platform?.artifacts[0];
+    if (product && platform && artifact) return { product, platform, artifact };
+  }
+  return undefined;
+}
+
+export default function Download() {
+  const detected = useMemo(() => detectOs(), []);
+  const rec = useMemo(() => recommend(detected), [detected]);
 
   return (
     <section id="download">
       <div className="container">
-        <span className="eyebrow">Download · db-service</span>
-        <h2>Get the InSyncBee db-service.</h2>
+        <span className="eyebrow">Download</span>
+        <h2>Get InSyncBee.</h2>
         <p className="section-intro">
-          The headless background sync service. Version{" "}
-          <span className="text-accent">{DEFAULT_RELEASES.version}</span>{" "}
-          · Released {DEFAULT_RELEASES.releasedAt} · Channel: {DEFAULT_RELEASES.channel}
+          Version <span className="text-accent">{DEFAULT_RELEASES.version}</span>{" "}
+          · Released {DEFAULT_RELEASES.releasedAt} · Channel:{" "}
+          {DEFAULT_RELEASES.channel}
         </p>
 
-        {recommended && topArtifact && (
+        {rec && (
           <div className="download-recommended">
             <div className="rec-text">
-              <h3>We detected <span className="text-accent">{recommended.displayName}</span></h3>
-              <p>Recommended: {topArtifact.label} · {topArtifact.arch}</p>
+              <h3>
+                We detected{" "}
+                <span className="text-accent">{rec.platform.displayName}</span>
+              </h3>
+              <p>
+                Recommended: {rec.product.displayName} · {rec.artifact.label}
+              </p>
             </div>
             <a
               className="btn btn-primary btn-lg"
-              href={downloadUrl(topArtifact)}
+              href={downloadUrl(rec.artifact)}
               download
             >
               ↓ Download {DEFAULT_RELEASES.version}
@@ -90,15 +118,15 @@ export default function Download() {
           </div>
         )}
 
-        <div className="download-grid">
-          {DEFAULT_RELEASES.platforms.map((p) => (
-            <PlatformCard key={p.os} platform={p} />
-          ))}
-        </div>
+        {DEFAULT_RELEASES.products.map((p) => (
+          <ProductBlock key={p.id} product={p} />
+        ))}
 
         <p className="download-footnote">
-          Each archive ships with a <code>.sha256</code> checksum next to it on
-          the{" "}
+          The desktop app is the one with the window and the tray icon; the
+          db-service is the same sync engine with no UI, for servers and
+          headless boxes. Each file ships with a <code>.sha256</code> checksum
+          next to it on the{" "}
           <a className="text-accent" href={githubReleaseUrl()}>
             v{DEFAULT_RELEASES.version} GitHub Release
           </a>
