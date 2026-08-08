@@ -42,6 +42,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Store Google OAuth client credentials for both the CLI and the app
+    Configure {
+        /// Google OAuth client ID (defaults to $INSYNCBEE_CLIENT_ID)
+        #[arg(long)]
+        client_id: Option<String>,
+
+        /// Google OAuth client secret (defaults to $INSYNCBEE_CLIENT_SECRET)
+        #[arg(long)]
+        client_secret: Option<String>,
+    },
+
     /// Sign in with a Google account
     Login,
 
@@ -149,15 +160,46 @@ async fn main() -> anyhow::Result<()> {
     let db = Database::open(&paths.db_path)?;
 
     match cli.command {
+        Commands::Configure {
+            client_id,
+            client_secret,
+        } => {
+            // Falling back to the environment makes this a one-liner for
+            // anyone who already had the exports in their shell profile:
+            // `insyncbee configure` copies them into the config file the
+            // desktop app can actually see.
+            let creds = match (client_id, client_secret) {
+                (Some(id), Some(secret)) => OAuthCredentials {
+                    client_id: id,
+                    client_secret: secret,
+                },
+                (id, secret) => {
+                    let env = OAuthCredentials::from_env().map_err(|e| {
+                        anyhow::anyhow!(
+                            "pass --client-id and --client-secret, or set them in the \
+                             environment first ({e})"
+                        )
+                    })?;
+                    OAuthCredentials {
+                        client_id: id.unwrap_or(env.client_id),
+                        client_secret: secret.unwrap_or(env.client_secret),
+                    }
+                }
+            };
+            creds.save(&paths.credentials_path)?;
+            println!("Credentials saved to {}", paths.credentials_path.display());
+            println!("The desktop app picks these up without a restart.");
+        }
+
         Commands::Login => {
-            let creds = OAuthCredentials::from_env()?;
+            let creds = OAuthCredentials::load(&paths.credentials_path)?;
             let auth = AuthManager::new(creds, db);
             let account = auth.login().await?;
             println!("Logged in as: {} ({})", account.email, account.id);
         }
 
         Commands::Accounts => {
-            let creds = OAuthCredentials::from_env()?;
+            let creds = OAuthCredentials::load(&paths.credentials_path)?;
             let auth = AuthManager::new(creds, db);
             let accounts = auth.list_accounts()?;
             if accounts.is_empty() {
@@ -177,7 +219,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Commands::Logout { account } => {
-            let creds = OAuthCredentials::from_env()?;
+            let creds = OAuthCredentials::load(&paths.credentials_path)?;
             let auth = AuthManager::new(creds, db);
             auth.remove_account(&account)?;
             println!("Account removed.");
@@ -271,7 +313,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Commands::Sync { pair, dry_run } => {
-            let creds = OAuthCredentials::from_env()?;
+            let creds = OAuthCredentials::load(&paths.credentials_path)?;
             let pairs = if let Some(pair_id) = pair {
                 let p = db
                     .with_conn(|conn| SyncPair::get_by_id(conn, &pair_id))?
@@ -346,7 +388,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Commands::Daemon => {
-            run_daemon(db).await?;
+            run_daemon(db, &paths.credentials_path).await?;
         }
     }
 
@@ -354,8 +396,8 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Run the background sync daemon: watch local files + poll remote changes.
-async fn run_daemon(db: Database) -> anyhow::Result<()> {
-    let creds = OAuthCredentials::from_env()?;
+async fn run_daemon(db: Database, credentials_path: &std::path::Path) -> anyhow::Result<()> {
+    let creds = OAuthCredentials::load(credentials_path)?;
 
     println!("InSyncBee daemon starting...");
 

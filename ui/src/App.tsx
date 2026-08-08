@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import changelogMd from "../../CHANGELOG.md?raw";
 
-const APP_VERSION = "0.2.3";
+const APP_VERSION = "0.2.4";
 
 interface UploadProgress {
   syncPairId: string;

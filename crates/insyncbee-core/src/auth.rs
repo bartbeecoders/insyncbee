@@ -22,7 +22,7 @@ const SCOPES: &[&str] = &[
 ];
 
 /// Credentials loaded from environment or config.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OAuthCredentials {
     pub client_id: String,
     pub client_secret: String,
@@ -39,6 +39,66 @@ impl OAuthCredentials {
             client_id,
             client_secret,
         })
+    }
+
+    /// Read credentials from `credentials.json` in the config directory.
+    pub fn from_file(path: &std::path::Path) -> Result<Self> {
+        let raw = std::fs::read_to_string(path).map_err(|e| {
+            crate::Error::Auth(format!("could not read {}: {e}", path.display()))
+        })?;
+        serde_json::from_str(&raw)
+            .map_err(|e| crate::Error::Auth(format!("could not parse {}: {e}", path.display())))
+    }
+
+    /// Environment first, then the config file.
+    ///
+    /// The environment keeps working for shells and CI, but it is not a
+    /// mechanism a GUI can rely on: apps started from a desktop launcher,
+    /// a file manager, or an autostart entry inherit the session
+    /// environment, not the one your shell profile builds. Credentials that
+    /// only ever lived in `~/.bashrc` made every desktop launch report
+    /// "OAuth credentials not configured".
+    pub fn load(credentials_path: &std::path::Path) -> Result<Self> {
+        match Self::from_env() {
+            Ok(creds) => Ok(creds),
+            Err(env_err) => match Self::from_file(credentials_path) {
+                Ok(creds) => Ok(creds),
+                Err(_) if !credentials_path.exists() => Err(crate::Error::Auth(format!(
+                    "OAuth credentials not configured. Run `insyncbee configure \
+                     --client-id <id> --client-secret <secret>`, or set \
+                     INSYNCBEE_CLIENT_ID and INSYNCBEE_CLIENT_SECRET ({env_err})"
+                ))),
+                Err(file_err) => Err(file_err),
+            },
+        }
+    }
+
+    /// Write credentials to the config file, readable only by this user.
+    pub fn save(&self, credentials_path: &std::path::Path) -> Result<()> {
+        if let Some(parent) = credentials_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| crate::Error::Auth(format!("could not create {}: {e}", parent.display())))?;
+        }
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| crate::Error::Auth(format!("could not serialize credentials: {e}")))?;
+        std::fs::write(credentials_path, json).map_err(|e| {
+            crate::Error::Auth(format!("could not write {}: {e}", credentials_path.display()))
+        })?;
+
+        // The client secret is not a password, but it is not public either;
+        // no reason for it to be world-readable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(credentials_path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| {
+                    crate::Error::Auth(format!(
+                        "could not restrict permissions on {}: {e}",
+                        credentials_path.display()
+                    ))
+                })?;
+        }
+        Ok(())
     }
 }
 
@@ -325,4 +385,65 @@ async fn fetch_user_info(access_token: &str) -> anyhow::Result<UserInfo> {
         .error_for_status()?;
     let info: UserInfo = resp.json().await?;
     Ok(info)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Deliberately no test that mutates INSYNCBEE_* env vars: cargo runs
+    // tests in threads of one process, so an env write in one test is
+    // visible to every other, and `load`'s precedence would flake.
+    // The env arm is a one-line `from_env` call; what's worth pinning down
+    // is the file arm that the desktop app depends on.
+
+    #[test]
+    fn saved_credentials_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("credentials.json");
+
+        let creds = OAuthCredentials {
+            client_id: "id.apps.googleusercontent.com".into(),
+            client_secret: "secret".into(),
+        };
+        creds.save(&path).unwrap();
+
+        let loaded = OAuthCredentials::from_file(&path).unwrap();
+        assert_eq!(loaded.client_id, creds.client_id);
+        assert_eq!(loaded.client_secret, creds.client_secret);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_credentials_are_not_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        OAuthCredentials {
+            client_id: "id".into(),
+            client_secret: "secret".into(),
+        }
+        .save(&path)
+        .unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "credentials should be owner-only, got {mode:o}");
+    }
+
+    #[test]
+    fn missing_file_and_no_env_names_both_ways_to_fix_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+
+        // Only meaningful when the env is not configured, which is the case
+        // in CI and for any developer who uses the config file instead.
+        if OAuthCredentials::from_env().is_ok() {
+            return;
+        }
+
+        let err = OAuthCredentials::load(&path).unwrap_err().to_string();
+        assert!(err.contains("insyncbee configure"), "got: {err}");
+        assert!(err.contains("INSYNCBEE_CLIENT_ID"), "got: {err}");
+    }
 }

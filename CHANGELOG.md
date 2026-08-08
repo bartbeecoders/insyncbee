@@ -4,6 +4,25 @@ All notable changes to InSyncBee are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.4] — 2026-08-08
+
+### Fixed
+- **The desktop app can find its OAuth credentials.** It read them only from
+  environment variables, so an app launched from the desktop menu, a file
+  manager, or an autostart entry — none of which read your shell profile —
+  failed every login and reconnect with "OAuth credentials not configured",
+  even with the exports sitting in `~/.bashrc`. Credentials now fall back to
+  `~/.config/insyncbee/credentials.json`, which both launch paths can see.
+- Credentials are resolved per operation instead of once at startup, so
+  configuring them (or fixing a typo) no longer needs an app restart.
+
+### Added
+- **`insyncbee configure`** — writes `~/.config/insyncbee/credentials.json`
+  with owner-only permissions. With no arguments it copies whatever is already
+  in the environment, so existing shell-profile setups become one command.
+- The "not configured" error now names both ways to fix it instead of only
+  the environment variables.
+
 ## [0.2.3] — 2026-08-08
 
 ### Fixed

@@ -48,14 +48,28 @@ InSyncBee needs Google OAuth credentials to access Google Drive. You must create
 5. Application type: **Desktop app**
 6. Download the credentials
 
-Set the credentials as environment variables:
+Store them once:
 
 ```bash
-export INSYNCBEE_CLIENT_ID="your-client-id.apps.googleusercontent.com"
-export INSYNCBEE_CLIENT_SECRET="your-client-secret"
+insyncbee configure --client-id "your-id.apps.googleusercontent.com" \
+                    --client-secret "your-secret"
 ```
 
-Add these to your shell profile (`~/.bashrc`, `~/.zshrc`, etc.) so they persist across sessions.
+That writes `~/.config/insyncbee/credentials.json` (owner-readable only), which
+both the CLI and the desktop app read.
+
+**Use the file, not just your shell profile, if you use the desktop app.**
+Environment variables still work and take precedence:
+
+```bash
+export INSYNCBEE_CLIENT_ID="your-id.apps.googleusercontent.com"
+export INSYNCBEE_CLIENT_SECRET="your-secret"
+```
+
+but exports in `~/.bashrc` are only seen by interactive shells. An app started
+from your desktop menu, a file manager, or an autostart entry inherits none of
+them and reports "OAuth credentials not configured". If you already have the
+exports, `insyncbee configure` with no arguments copies them into the file.
 
 ## Quick Start
 
@@ -63,9 +77,8 @@ Add these to your shell profile (`~/.bashrc`, `~/.zshrc`, etc.) so they persist 
 # 1. Install dependencies
 ./scripts/setup.sh
 
-# 2. Set OAuth credentials (see above)
-export INSYNCBEE_CLIENT_ID="..."
-export INSYNCBEE_CLIENT_SECRET="..."
+# 2. Store OAuth credentials (see above)
+./scripts/dev-cli.sh configure --client-id "..." --client-secret "..."
 
 # 3. Sign in with Google
 ./scripts/dev-cli.sh login
@@ -213,14 +226,18 @@ InSyncBee stores its database and logs in your platform's data directory:
 
 | Variable | Required | Description |
 |---|---|---|
-| `INSYNCBEE_CLIENT_ID` | Yes | Google OAuth client ID |
-| `INSYNCBEE_CLIENT_SECRET` | Yes | Google OAuth client secret |
+| `INSYNCBEE_CLIENT_ID` | No | Google OAuth client ID. Overrides `credentials.json` |
+| `INSYNCBEE_CLIENT_SECRET` | No | Google OAuth client secret. Overrides `credentials.json` |
 | `RUST_LOG` | No | Log level filter (e.g. `info`, `debug`, `insyncbee_core=debug`) |
 
 ## Troubleshooting
 
-**"INSYNCBEE_CLIENT_ID env var not set"**
-Set the OAuth credentials as described in the Google OAuth Setup section above.
+**"OAuth credentials not configured"**
+Run `insyncbee configure --client-id <id> --client-secret <secret>`. If it only
+happens when you launch the app from your desktop menu but not from a terminal,
+your credentials are exports in a shell profile that a desktop launcher never
+reads — `insyncbee configure` with no arguments copies them into
+`~/.config/insyncbee/credentials.json`, which both launch paths can see.
 
 **Login opens browser but nothing happens**
 Make sure no firewall is blocking localhost connections. The OAuth callback uses a random local port (`127.0.0.1:<port>`).

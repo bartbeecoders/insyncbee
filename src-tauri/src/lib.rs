@@ -22,7 +22,10 @@ use tauri_plugin_autostart::{ManagerExt, MacosLauncher};
 
 struct AppState {
     db: Database,
-    creds: Option<OAuthCredentials>,
+    /// Credentials are resolved per call rather than cached at startup, so
+    /// configuring them (or fixing a typo) takes effect without restarting
+    /// the app.
+    credentials_path: std::path::PathBuf,
 }
 
 type DbState = Mutex<AppState>;
@@ -95,10 +98,7 @@ fn resume_sync_pair(state: State<DbState>, id: String) -> Result<(), String> {
 async fn start_login(state: State<'_, DbState>) -> Result<Account, String> {
     let (db, creds) = {
         let s = state.lock().map_err(|e| e.to_string())?;
-        let creds = s
-            .creds
-            .clone()
-            .ok_or_else(|| "OAuth credentials not configured (set INSYNCBEE_CLIENT_ID and INSYNCBEE_CLIENT_SECRET)".to_string())?;
+        let creds = OAuthCredentials::load(&s.credentials_path).map_err(|e| e.to_string())?;
         (s.db.clone(), creds)
     };
 
@@ -113,10 +113,7 @@ async fn reconnect_account(
 ) -> Result<Account, String> {
     let (db, creds) = {
         let s = state.lock().map_err(|e| e.to_string())?;
-        let creds = s
-            .creds
-            .clone()
-            .ok_or_else(|| "OAuth credentials not configured (set INSYNCBEE_CLIENT_ID and INSYNCBEE_CLIENT_SECRET)".to_string())?;
+        let creds = OAuthCredentials::load(&s.credentials_path).map_err(|e| e.to_string())?;
         (s.db.clone(), creds)
     };
 
@@ -142,10 +139,7 @@ async fn resolve_conflict(
 ) -> Result<(), String> {
     let (db, creds) = {
         let s = state.lock().map_err(|e| e.to_string())?;
-        let creds = s
-            .creds
-            .clone()
-            .ok_or_else(|| "OAuth credentials not configured".to_string())?;
+        let creds = OAuthCredentials::load(&s.credentials_path).map_err(|e| e.to_string())?;
         (s.db.clone(), creds)
     };
 
@@ -279,10 +273,7 @@ async fn trigger_sync(
 ) -> Result<String, String> {
     let (db, creds) = {
         let s = state.lock().map_err(|e| e.to_string())?;
-        let creds = s
-            .creds
-            .clone()
-            .ok_or_else(|| "OAuth credentials not configured".to_string())?;
+        let creds = OAuthCredentials::load(&s.credentials_path).map_err(|e| e.to_string())?;
         (s.db.clone(), creds)
     };
 
@@ -619,10 +610,7 @@ async fn list_drive_folders(
 ) -> Result<Vec<DriveFolder>, String> {
     let (db, creds) = {
         let s = state.lock().map_err(|e| e.to_string())?;
-        let creds = s
-            .creds
-            .clone()
-            .ok_or_else(|| "OAuth credentials not configured".to_string())?;
+        let creds = OAuthCredentials::load(&s.credentials_path).map_err(|e| e.to_string())?;
         (s.db.clone(), creds)
     };
 
@@ -663,10 +651,7 @@ async fn create_drive_folder(
 
     let (db, creds) = {
         let s = state.lock().map_err(|e| e.to_string())?;
-        let creds = s
-            .creds
-            .clone()
-            .ok_or_else(|| "OAuth credentials not configured".to_string())?;
+        let creds = OAuthCredentials::load(&s.credentials_path).map_err(|e| e.to_string())?;
         (s.db.clone(), creds)
     };
 
@@ -717,9 +702,10 @@ pub fn run() {
     let paths = AppPaths::new().expect("Failed to initialize app paths");
     let db = Database::open(&paths.db_path).expect("Failed to open database");
 
-    let creds = OAuthCredentials::from_env().ok();
-
-    let app_state = AppState { db, creds };
+    let app_state = AppState {
+        db,
+        credentials_path: paths.credentials_path.clone(),
+    };
 
     let start_in_tray = std::env::args()
         .any(|a| a == "--tray" || a == "--background" || a == "--hidden");
