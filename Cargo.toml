@@ -3,6 +3,7 @@ members = [
     "crates/insyncbee-core",
     "crates/insyncbee-daemon",
     "src-tauri",
+    "tests/e2e",
 ]
 resolver = "2"
 

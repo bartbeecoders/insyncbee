@@ -102,10 +102,43 @@ fn classify_event(event: notify_debouncer_full::DebouncedEvent) -> Vec<FsEvent> 
 }
 
 /// Compute the blake3 hash of a file.
+///
+/// This is our *local-side* content identity: it's what gets stored in
+/// `file_index.local_hash` and compared against on the next cycle to answer
+/// "did the user change this file?". It is deliberately **not** comparable
+/// to anything Drive returns — see [`md5_file`].
 pub fn hash_file(path: &Path) -> anyhow::Result<String> {
     let data = std::fs::read(path)?;
     let hash = blake3::hash(&data);
     Ok(hash.to_hex().to_string())
+}
+
+/// Compute the MD5 of a file as lowercase hex — the one hash that is
+/// directly comparable to Drive's `md5Checksum` field.
+///
+/// Needed only where we must answer "is the local file the same content as
+/// the remote one?" without a base entry to compare through, i.e. the
+/// first sync of a folder that already exists on both sides. Everywhere
+/// else we compare local-to-local (blake3) and remote-to-remote (Drive's
+/// own MD5), which never mixes the two spaces.
+///
+/// Streams the file in chunks so adopting a folder of large files doesn't
+/// pull each one into RAM.
+pub fn md5_file(path: &Path) -> anyhow::Result<String> {
+    use md5::{Digest, Md5};
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Md5::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Scan a directory recursively and return relative paths with their metadata.

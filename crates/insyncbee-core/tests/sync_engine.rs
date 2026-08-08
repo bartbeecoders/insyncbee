@@ -531,3 +531,61 @@ async fn fetch_remote_tree(
 fn _path_display(p: &Path) -> String {
     p.display().to_string()
 }
+
+// ── Ignore-rule symmetry ────────────────────────────────────────────────
+
+/// `watcher::scan_directory` hides dot-prefixed entries. The remote side has
+/// to hide them too, or a remote `.config` is downloaded, becomes invisible
+/// to the next scan, reads as `(local=false, remote=true, base=true)` — the
+/// signature of a local delete — and gets trashed on Drive.
+///
+/// Found by the live suite (`tests/e2e`, scenario H8); pinned here so CI
+/// catches a regression without Google credentials.
+#[tokio::test]
+async fn hidden_remote_entries_are_ignored_never_deleted() {
+    let fx = SyncFixture::new(SyncMode::TwoWay);
+    let id = fx.fake.insert_file(".config", &fx.remote_root, b"user data".to_vec());
+
+    let engine = SyncEngine::new(fx.db.clone(), fx.pair.clone());
+    let first = engine.sync(&fx.fake).await.unwrap();
+    assert_eq!(first.downloaded, 0, "a hidden remote entry was pulled down: {first}");
+    assert!(
+        !fx.local_path().join(".config").exists(),
+        "hidden remote entry materialised locally"
+    );
+
+    // The cycle that used to destroy it.
+    let engine = SyncEngine::new(fx.db.clone(), fx.pair.clone());
+    let second = engine.sync(&fx.fake).await.unwrap();
+    assert_eq!(second.deleted, 0, "a hidden remote entry was deleted: {second}");
+
+    assert!(
+        fx.fake.snapshot_by_name().contains_key(".config"),
+        "DATA LOSS: hidden remote entry was trashed by a later cycle"
+    );
+    let _ = id;
+}
+
+/// A folder that already exists on both sides with identical content must be
+/// adopted silently. The engine compares a local hash to Drive's
+/// `md5Checksum` here, so the two must be in the same hash space — comparing
+/// blake3 to MD5 made every adopted file look divergent and, under the
+/// default `KeepBoth`, spawned a conflicted copy of every single file.
+///
+/// Found by the live suite (`tests/e2e`, scenario B3).
+#[tokio::test]
+async fn identical_content_on_both_sides_is_adopted_not_conflicted() {
+    let fx = SyncFixture::new(SyncMode::TwoWay);
+    let content = b"byte-for-byte the same".to_vec();
+    fx.write_local("same.txt", "byte-for-byte the same");
+    fx.fake.insert_file("same.txt", &fx.remote_root, content);
+
+    let engine = SyncEngine::new(fx.db.clone(), fx.pair.clone());
+    let report = engine.sync(&fx.fake).await.unwrap();
+
+    assert_eq!(
+        (report.conflicts, report.uploaded, report.downloaded),
+        (0, 0, 0),
+        "identical content should be adopted with no work at all: {report}"
+    );
+}

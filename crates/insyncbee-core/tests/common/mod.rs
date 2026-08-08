@@ -282,14 +282,23 @@ impl SyncFixture {
 }
 
 // ── md5 ──────────────────────────────────────────────────────────────
-// Drive content checksums are MD5. We emit a small reimplementation here so
-// the integration tests don't have to take a runtime dependency on a md5
-// crate just for one helper.
 
+/// Drive content checksums are MD5, so the fake emits **real** MD5.
+///
+/// This used to be a truncated blake3 "close enough" stand-in, and that
+/// single shortcut hid a production bug for the entire life of the fake:
+/// the engine compared a local blake3 hash against Drive's MD5 when
+/// adopting a folder that already existed on both sides. In the fake both
+/// sides were blake3, so they matched and the test passed; against real
+/// Drive they could never match, so every adopted file was reported as a
+/// conflict. The live suite (`tests/e2e`, scenario B3) caught it.
+///
+/// The lesson is encoded here deliberately: a fake may be *simpler* than
+/// the real service, but it must never be *different* in a way the code
+/// under test can observe.
 fn md5_hex(bytes: &[u8]) -> String {
-    // Use a minimal stable hash to mimic Drive's md5Checksum field. We don't
-    // actually need cryptographic md5 here — only stability across runs.
-    // blake3 is already a dependency, so use a truncated blake3 hex string.
-    let h = blake3::hash(bytes);
-    h.to_hex().as_str().chars().take(32).collect()
+    use md5::{Digest, Md5};
+    let mut hasher = Md5::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
 }

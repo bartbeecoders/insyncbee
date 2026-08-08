@@ -57,11 +57,45 @@ pub enum SyncAction {
         relative_path: String,
         local_path: PathBuf,
         remote_id: String,
+        kind: ConflictKind,
     },
     Skip {
         relative_path: String,
         reason: String,
     },
+}
+
+/// Which of the three-way comparison arms produced a conflict.
+///
+/// This drives one decision: whether resolving the conflict may write a new
+/// base state into `file_index`. When both sides still hold a live file,
+/// recording the resolution is what makes the pair *converge* — without it
+/// the same conflict re-fires on every cycle forever (and `KeepBoth` spawns
+/// a fresh timestamped copy each time).
+///
+/// When one side was deleted, no safe base state exists: writing one would
+/// make the next cycle read the surviving file as "unchanged since the
+/// delete" and propagate the deletion, destroying the very edit the
+/// conflict was protecting. Those arms stay unresolved on purpose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictKind {
+    /// Both sides edited a tracked file between cycles.
+    BothModified,
+    /// The file exists on both sides with different content and no base
+    /// entry — the first sync of a folder that already had contents.
+    FirstSyncDivergent,
+    /// Deleted locally, modified remotely.
+    LocalDeletedRemoteModified,
+    /// Deleted remotely, modified locally.
+    RemoteDeletedLocalModified,
+}
+
+impl ConflictKind {
+    /// True when a live file exists on *both* sides, so the resolution can
+    /// be recorded as the new base state.
+    pub fn both_sides_present(&self) -> bool {
+        matches!(self, Self::BothModified | Self::FirstSyncDivergent)
+    }
 }
 
 /// The sync engine coordinates syncing for a single sync pair.
@@ -367,11 +401,18 @@ impl SyncEngine {
                             relative_path: path.clone(),
                             local_path: local_root.join(path),
                             remote_id: file.id.clone(),
+                            kind: ConflictKind::FirstSyncDivergent,
                         }
                     } else {
-                        // Compare content
-                        let local_hash = watcher::hash_file(&info.absolute_path).ok();
-                        if local_hash.as_deref() == file.md5_checksum.as_deref() {
+                        // Compare content across the local/remote boundary.
+                        // This is the ONE place where we compare a local file
+                        // to a remote one without a base entry to route
+                        // through, so it must use MD5 — the only hash Drive
+                        // exposes. Comparing blake3 here would make every
+                        // adopted folder look divergent and spawn a
+                        // conflicted copy of every single file.
+                        let local_md5 = watcher::md5_file(&info.absolute_path).ok();
+                        if local_md5.is_some() && local_md5.as_deref() == file.md5_checksum.as_deref() {
                             SyncAction::Skip {
                                 relative_path: path.clone(),
                                 reason: "identical content".into(),
@@ -381,6 +422,7 @@ impl SyncEngine {
                                 relative_path: path.clone(),
                                 local_path: local_root.join(path),
                                 remote_id: file.id.clone(),
+                                kind: ConflictKind::FirstSyncDivergent,
                             }
                         }
                     }
@@ -424,6 +466,7 @@ impl SyncEngine {
                                 relative_path: path.clone(),
                                 local_path: local_root.join(path),
                                 remote_id: file.id.clone(),
+                                kind: ConflictKind::BothModified,
                             },
                             _ => SyncAction::Skip {
                                 relative_path: path.clone(),
@@ -444,6 +487,7 @@ impl SyncEngine {
                                 relative_path: path.clone(),
                                 local_path: local_root.join(path),
                                 remote_id: file.id.clone(),
+                                kind: ConflictKind::LocalDeletedRemoteModified,
                             }
                         } else {
                             SyncAction::DeleteRemote {
@@ -470,6 +514,7 @@ impl SyncEngine {
                                 relative_path: path.clone(),
                                 local_path: local_root.join(path),
                                 remote_id: entry.remote_id.clone().unwrap_or_default(),
+                                kind: ConflictKind::RemoteDeletedLocalModified,
                             }
                         } else {
                             SyncAction::DeleteLocal {
@@ -644,9 +689,11 @@ impl SyncEngine {
                 relative_path,
                 local_path,
                 remote_id,
+                kind,
             } => {
-                tracing::warn!("Conflict detected: {relative_path}");
-                self.handle_conflict(relative_path, local_path, remote_id, drive).await?;
+                tracing::warn!("Conflict detected: {relative_path} ({kind:?})");
+                self.handle_conflict(relative_path, local_path, remote_id, *kind, drive)
+                    .await?;
             }
             SyncAction::Skip {
                 relative_path,
@@ -659,13 +706,31 @@ impl SyncEngine {
     }
 
     /// Handle a conflict according to the pair's conflict policy.
+    ///
+    /// Every policy except [`ConflictPolicy::Ask`] *resolves* the conflict,
+    /// and a resolution is only complete once the outcome is recorded as the
+    /// new base state — otherwise the next cycle recomputes the identical
+    /// conflict from the identical stale base and resolves it again, forever.
+    /// For `KeepBoth` that meant a new timestamped copy on every poll
+    /// interval; for the overwrite policies, re-transferring the same file
+    /// on every cycle.
+    ///
+    /// The write-back is gated on [`ConflictKind::both_sides_present`]: when
+    /// one side was deleted there is no base state that doesn't tell the next
+    /// cycle to finish the deletion, so those conflicts deliberately stay
+    /// pending. See `tests/SCENARIOS.md` (D3/D4) for that open gap.
     async fn handle_conflict(
         &self,
         relative_path: &str,
         local_path: &Path,
         remote_id: &str,
+        kind: ConflictKind,
         drive: &dyn DriveClient,
     ) -> anyhow::Result<()> {
+        // Set by each resolving branch to the remote file as it stands after
+        // resolution; `None` means "left unresolved on purpose".
+        let resolved: Option<DriveFile>;
+
         match self.pair.conflict_policy {
             ConflictPolicy::KeepBoth => {
                 // Download remote as a conflicted copy
@@ -683,14 +748,19 @@ impl SyncEngine {
 
                 self.download_via(drive, remote_id, &conflict_path).await?;
                 tracing::info!("Created conflicted copy: {}", conflict_path.display());
+                // Both versions are now on disk, so the divergence has been
+                // dealt with as far as the engine is concerned. Recording it
+                // is what stops the next cycle producing another copy.
+                resolved = Some(drive.get_file(remote_id).await?);
             }
             ConflictPolicy::PreferLocal => {
                 // Upload local, overwriting remote
-                self.update_remote_via(drive, remote_id, local_path).await?;
+                resolved = Some(self.update_remote_via(drive, remote_id, local_path).await?);
             }
             ConflictPolicy::PreferRemote => {
                 // Download remote, overwriting local
                 self.download_via(drive, remote_id, local_path).await?;
+                resolved = Some(drive.get_file(remote_id).await?);
             }
             ConflictPolicy::NewestWins => {
                 // Compare modification times
@@ -710,10 +780,12 @@ impl SyncEngine {
 
                 match (local_mtime, remote_mtime) {
                     (Some(l), Some(r)) if l >= r => {
-                        self.update_remote_via(drive, remote_id, local_path).await?;
+                        resolved =
+                            Some(self.update_remote_via(drive, remote_id, local_path).await?);
                     }
                     _ => {
                         self.download_via(drive, remote_id, local_path).await?;
+                        resolved = Some(drive.get_file(remote_id).await?);
                     }
                 }
             }
@@ -741,8 +813,16 @@ impl SyncEngine {
                     entry.upsert(conn)?;
                     Ok(())
                 })?;
+                // Deliberately unresolved: the user hasn't chosen yet, so the
+                // conflict must keep being reported on every cycle until they do.
+                resolved = None;
             }
         }
+
+        if let (true, Some(remote_file)) = (kind.both_sides_present(), resolved) {
+            self.update_index(relative_path, local_path, &remote_file)?;
+        }
+
         Ok(())
     }
 
@@ -801,6 +881,18 @@ impl SyncEngine {
             let files = drive.list_all_files(folder_id).await?;
 
             for file in files {
+                // Apply the scanner's hidden-file rule to the remote side
+                // too. `watcher::scan_directory` skips dot-prefixed entries,
+                // so a remote dotfile we downloaded would be invisible to the
+                // very next scan — the three-way comparison would read
+                // `(local=false, remote=true, base=true)`, conclude the user
+                // deleted it, and trash it on Drive. Ignoring it on both
+                // sides keeps the rule symmetric and the file safe.
+                if is_hidden_name(&file.name) {
+                    tracing::debug!("Ignoring hidden remote entry: {}/{}", prefix, file.name);
+                    continue;
+                }
+
                 let path = if prefix.is_empty() {
                     file.name.clone()
                 } else {
@@ -958,6 +1050,15 @@ fn sort_actions(actions: &mut Vec<SyncAction>) {
         };
         (bucket, depth_key, path)
     });
+}
+
+/// Entries InSyncBee deliberately does not sync, in either direction.
+///
+/// Must stay in agreement with the filter in
+/// [`watcher::scan_directory`] — an entry that one side hides and the other
+/// syncs is read as a deletion by the three-way comparison.
+fn is_hidden_name(name: &str) -> bool {
+    name.starts_with('.')
 }
 
 fn action_path(action: &SyncAction) -> Option<String> {

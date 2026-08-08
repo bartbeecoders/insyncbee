@@ -1,0 +1,28 @@
+[package]
+name = "insyncbee-e2e"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Live end-to-end test harness for InSyncBee (runs against a real Google Drive account)"
+publish = false
+
+# The crate is a harness, not a shipped library. `cargo build` produces
+# nothing useful; everything of interest lives in `tests/`.
+[lib]
+name = "insyncbee_e2e"
+path = "src/lib.rs"
+
+[dependencies]
+insyncbee-core = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+tempfile = "3"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

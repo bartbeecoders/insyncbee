@@ -101,6 +101,58 @@ async fn prefer_remote_overwrites_local() {
     assert_eq!(local, b"REMOTE EDIT", "local should now mirror remote bytes");
 }
 
+/// Resolving a conflict must also *record* the resolution, otherwise the
+/// next cycle recomputes the identical conflict from the identical stale
+/// base and resolves it again — forever.
+///
+/// For `KeepBoth` that meant a fresh timestamped copy on every poll
+/// interval: a file duplicating itself roughly twice a minute until the
+/// disk filled. Caught by the live suite (`tests/e2e`, scenario F1/F2);
+/// pinned here so CI catches a regression without Google credentials.
+#[tokio::test]
+async fn keep_both_does_not_spawn_a_new_copy_on_every_cycle() {
+    let fx = arrange_conflict(ConflictPolicy::KeepBoth).await;
+
+    for cycle in 1..=3 {
+        let engine = SyncEngine::new(fx.db.clone(), fx.pair.clone());
+        engine
+            .sync(&fx.fake)
+            .await
+            .unwrap_or_else(|e| panic!("cycle {cycle} failed: {e}"));
+    }
+
+    let copies = std::fs::read_dir(fx.local_path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().contains("(conflict "))
+        .count();
+
+    assert_eq!(
+        copies, 1,
+        "three sync cycles produced {copies} conflicted copies; resolution is not being recorded"
+    );
+}
+
+/// The overwrite policies must converge: once local has won, the next cycle
+/// has nothing left to do. Without a recorded resolution the engine
+/// re-uploads the same bytes on every cycle forever.
+#[tokio::test]
+async fn prefer_local_converges_after_resolving() {
+    let fx = arrange_conflict(ConflictPolicy::PreferLocal).await;
+
+    let engine = SyncEngine::new(fx.db.clone(), fx.pair.clone());
+    let first = engine.sync(&fx.fake).await.unwrap();
+    assert_eq!(first.conflicts, 1, "expected the arranged conflict");
+
+    let engine = SyncEngine::new(fx.db.clone(), fx.pair.clone());
+    let second = engine.sync(&fx.fake).await.unwrap();
+    assert_eq!(
+        (second.conflicts, second.uploaded, second.downloaded),
+        (0, 0, 0),
+        "a resolved conflict re-fired on the next cycle: {second}"
+    );
+}
+
 #[tokio::test]
 async fn ask_marks_entry_as_conflict_in_db() {
     let fx = arrange_conflict(ConflictPolicy::Ask).await;

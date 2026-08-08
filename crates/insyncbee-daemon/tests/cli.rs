@@ -108,14 +108,19 @@ fn add_then_list_then_pause_then_remove() {
     assert!(stdout.contains("Pictures"), "list should show new pair, got: {stdout}");
 
     // Extract pair UUID from list output.
-    let pair_id = stdout
+    //
+    // Not `lines().next()`: the binary initialises tracing with a stdout
+    // layer, so the first stdout line is the `Logs: …` banner, not a pair
+    // row. Select the row by its content instead of by position.
+    let pair_line = stdout
         .lines()
-        .next()
-        .unwrap()
+        .find(|l| l.contains("Pictures") && l.contains('('))
+        .unwrap_or_else(|| panic!("no pair row in list output, got: {stdout}"));
+    let pair_id = pair_line
         .split('(')
         .nth(1)
         .and_then(|s| s.split(')').next())
-        .unwrap();
+        .unwrap_or_else(|| panic!("no pair id in row: {pair_line}"));
 
     make_cmd()
         .args(["pause", pair_id])
