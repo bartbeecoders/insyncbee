@@ -15,7 +15,7 @@ use insyncbee_core::db::models::{
 /// The current schema version. Bump this in the same commit that adds a
 /// migration — a failure here means migrations and this constant disagree,
 /// which is exactly the check worth having.
-const EXPECTED_SCHEMA_VERSION: i64 = 3;
+const EXPECTED_SCHEMA_VERSION: i64 = 4;
 
 #[test]
 fn migrations_run_on_open() {

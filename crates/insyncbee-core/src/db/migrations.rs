@@ -18,7 +18,12 @@ pub fn run_all(conn: &Connection) -> Result<()> {
         )
         .unwrap_or(0);
 
-    let migrations: &[(&str, i64)] = &[(MIGRATION_001, 1), (MIGRATION_002, 2), (MIGRATION_003, 3)];
+    let migrations: &[(&str, i64)] = &[
+        (MIGRATION_001, 1),
+        (MIGRATION_002, 2),
+        (MIGRATION_003, 3),
+        (MIGRATION_004, 4),
+    ];
 
     for (sql, version) in migrations {
         if *version > current {
@@ -129,4 +134,45 @@ ALTER TABLE sync_pairs ADD COLUMN encryption_verifier BLOB;
 const MIGRATION_003: &str = "
 ALTER TABLE change_log ADD COLUMN bytes INTEGER;
 ALTER TABLE change_log ADD COLUMN duration_ms INTEGER;
+";
+
+// ── v4: folder actions in the activity feed ─────────────────────────
+// Folder creates were the one thing a sync did that left no trace: the
+// activity feed showed the files that landed but never the directories
+// made to hold them, so a sync that only created folders looked like it
+// had done nothing at all.
+//
+// `action` is constrained by a CHECK, and SQLite cannot alter one in
+// place — this is the documented table-rebuild dance. foreign_keys is
+// switched off around it because `change_log` carries an ON DELETE
+// CASCADE reference to `sync_pairs`, and the DROP would otherwise be
+// evaluated against the constraint mid-rebuild.
+const MIGRATION_004: &str = "
+PRAGMA foreign_keys=OFF;
+
+CREATE TABLE change_log_new (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    sync_pair_id    TEXT NOT NULL REFERENCES sync_pairs(id) ON DELETE CASCADE,
+    relative_path   TEXT NOT NULL,
+    action          TEXT NOT NULL
+                    CHECK (action IN ('upload', 'download', 'delete-local', 'delete-remote',
+                                      'create-local-dir', 'create-remote-dir',
+                                      'rename', 'conflict', 'error', 'resolve')),
+    detail          TEXT,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    bytes           INTEGER,
+    duration_ms     INTEGER
+);
+
+INSERT INTO change_log_new (id, sync_pair_id, relative_path, action, detail, created_at, bytes, duration_ms)
+    SELECT id, sync_pair_id, relative_path, action, detail, created_at, bytes, duration_ms
+    FROM change_log;
+
+DROP TABLE change_log;
+ALTER TABLE change_log_new RENAME TO change_log;
+
+CREATE INDEX IF NOT EXISTS idx_change_log_pair ON change_log(sync_pair_id);
+CREATE INDEX IF NOT EXISTS idx_change_log_time ON change_log(created_at);
+
+PRAGMA foreign_keys=ON;
 ";

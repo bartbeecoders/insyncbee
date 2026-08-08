@@ -193,8 +193,8 @@ Start the desktop app in development mode:
 
 The GUI provides:
 
-- **Dashboard** — view connected accounts, sync pair status, trigger syncs, pause/resume pairs, and add new Google accounts
-- **Activity** — chronological feed of all sync events (uploads, downloads, deletes, conflicts). Each transfer shows its size and the speed it achieved, and a live readout at the top shows current up/down throughput while a sync is running
+- **Dashboard** — view connected accounts, sync pair status, trigger syncs, pause/resume pairs, and add new Google accounts. A pair that is syncing shows its current phase, progress through the action list, the file being handled, and live speed
+- **Activity** — chronological feed of all sync events (uploads, downloads, folder creates, deletes, conflicts). Each transfer shows its size and the speed it achieved, and a live readout at the top shows current up/down throughput while a sync is running
 - **Statistics** — how many files and bytes have been uploaded and downloaded, all-time and over the last 7 days, with average throughput and a per-sync-pair breakdown
 - **Conflicts** — list of unresolved conflicts with resolution buttons (Keep Local / Keep Remote / Keep Both)
 

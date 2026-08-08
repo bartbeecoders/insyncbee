@@ -9,7 +9,7 @@ use insyncbee_core::drive::{HttpDriveClient, TransferKind};
 use insyncbee_core::keystore;
 use std::sync::Arc;
 use tauri::Emitter;
-use insyncbee_core::sync_engine::SyncEngine;
+use insyncbee_core::sync_engine::{SyncEngine, SyncStatus};
 use insyncbee_core::AppPaths;
 use serde::Serialize;
 use std::fs;
@@ -366,7 +366,24 @@ async fn trigger_sync(
 
     let drive = HttpDriveClient::new(auth, pair.account_id.clone())
         .with_progress_callback(progress_cb);
-    let mut engine = SyncEngine::new(db, pair.clone());
+
+    // Phase reporting: scanning and listing can take a while on a large
+    // pair, and folder work never moves bytes, so without this the
+    // dashboard has nothing to show for large stretches of a real sync.
+    let app_for_status = app.clone();
+    let pair_id_for_status = sync_pair_id.clone();
+    let status_cb: insyncbee_core::sync_engine::StatusCallback =
+        Arc::new(move |status: SyncStatus| {
+            let _ = app_for_status.emit(
+                "sync-status",
+                SyncStatusPayload {
+                    sync_pair_id: pair_id_for_status.clone(),
+                    status,
+                },
+            );
+        });
+
+    let mut engine = SyncEngine::new(db, pair.clone()).with_status_callback(status_cb);
     if pair.encryption_enabled {
         let cipher = keystore::load_cipher(&pair.id)
             .map_err(|e| e.to_string())?
@@ -381,6 +398,13 @@ async fn trigger_sync(
     let report = engine.sync(&drive).await.map_err(|e| e.to_string())?;
     let _ = app.emit("sync-finished", &sync_pair_id);
     Ok(report.to_string())
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SyncStatusPayload {
+    sync_pair_id: String,
+    status: SyncStatus,
 }
 
 #[derive(Serialize, Clone)]

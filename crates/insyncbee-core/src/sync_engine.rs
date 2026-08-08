@@ -108,11 +108,69 @@ pub struct SyncEngine {
     /// than silently writing plaintext to Drive — that's the intended
     /// safety property: callers MUST attach a cipher before sync.
     cipher: Option<Arc<FileCipher>>,
+    /// Reports which phase the cycle is in. A sync spends real time
+    /// scanning and listing before a single byte moves, and folder
+    /// creates and deletes never produce byte progress at all — without
+    /// this the UI has nothing to show during those stretches and a
+    /// working sync looks like a hung one.
+    status: Option<StatusCallback>,
+}
+
+/// Called as a sync cycle moves between phases.
+pub type StatusCallback = Arc<dyn Fn(SyncStatus) + Send + Sync>;
+
+/// Which phase a sync cycle is in, and how far through the work it is.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncStatus {
+    pub phase: SyncPhase,
+    /// Actions completed / total, meaningful in [`SyncPhase::Executing`].
+    pub done: usize,
+    pub total: usize,
+    /// What is being done right now, e.g. "upload" or "create-remote-dir".
+    pub action: Option<String>,
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SyncPhase {
+    ScanningLocal,
+    ListingRemote,
+    Comparing,
+    Executing,
+    Finished,
 }
 
 impl SyncEngine {
     pub fn new(db: Database, pair: SyncPair) -> Self {
-        Self { db, pair, cipher: None }
+        Self { db, pair, cipher: None, status: None }
+    }
+
+    /// Attach a phase reporter. The GUI uses this to drive its per-pair
+    /// activity indicator; the CLI leaves it unset.
+    pub fn with_status_callback(mut self, cb: StatusCallback) -> Self {
+        self.status = Some(cb);
+        self
+    }
+
+    fn report_status(
+        &self,
+        phase: SyncPhase,
+        done: usize,
+        total: usize,
+        action: Option<&str>,
+        path: Option<&str>,
+    ) {
+        if let Some(cb) = &self.status {
+            cb(SyncStatus {
+                phase,
+                done,
+                total,
+                action: action.map(str::to_string),
+                path: path.map(str::to_string),
+            });
+        }
     }
 
     /// Attach the cipher derived from the pair's passphrase. Required for
@@ -204,6 +262,7 @@ impl SyncEngine {
         tracing::info!("Starting sync for pair '{}' ({})", self.pair.name, self.pair.mode);
 
         // 1. Scan local filesystem
+        self.report_status(SyncPhase::ScanningLocal, 0, 0, None, None);
         let local_root = PathBuf::from(&self.pair.local_root);
         let local_files = watcher::scan_directory(&local_root)?;
         let local_map: HashMap<String, watcher::LocalFileInfo> = local_files
@@ -212,6 +271,7 @@ impl SyncEngine {
             .collect();
 
         // 2. Fetch remote file list (recursively)
+        self.report_status(SyncPhase::ListingRemote, 0, 0, None, None);
         let remote_files = self.fetch_remote_tree(drive, &self.pair.remote_root_id, "").await?;
         let remote_map: HashMap<String, DriveFile> = remote_files
             .iter()
@@ -228,6 +288,7 @@ impl SyncEngine {
             .collect();
 
         // 4. Compute sync actions via three-way comparison
+        self.report_status(SyncPhase::Comparing, 0, 0, None, None);
         let mut actions = self.compute_actions(&local_map, &remote_map, &base_map, &local_root);
 
         // 4b. Sort so dependencies are respected:
@@ -244,33 +305,55 @@ impl SyncEngine {
             .collect();
 
         // 5. Execute actions
-        for action in &actions {
+        //
+        // Skips are counted as work so the progress fraction matches the
+        // list the user would see: a cycle that skips 900 unchanged files
+        // and uploads 2 should not sit at "2 of 2" for its whole duration.
+        let total_actions = actions.len();
+        for (index, action) in actions.iter().enumerate() {
+            self.report_status(
+                SyncPhase::Executing,
+                index,
+                total_actions,
+                Some(action.kind()),
+                action_path(action).as_deref(),
+            );
             match self.execute_action(action, drive, &local_root, &mut remote_ids).await {
-                Ok(metrics) => match action {
+                Ok(outcome) => match action {
                     SyncAction::Upload { relative_path, .. }
                     | SyncAction::UpdateRemote { relative_path, .. } => {
                         report.uploaded += 1;
-                        report.bytes_uploaded += metrics.map_or(0, |m| m.bytes);
-                        self.log_transfer(relative_path, "upload", metrics);
+                        report.bytes_uploaded += outcome.metrics.map_or(0, |m| m.bytes);
+                        self.log_transfer(relative_path, "upload", outcome.metrics);
                     }
                     SyncAction::Download { relative_path, .. } => {
                         report.downloaded += 1;
-                        report.bytes_downloaded += metrics.map_or(0, |m| m.bytes);
-                        self.log_transfer(relative_path, "download", metrics);
+                        report.bytes_downloaded += outcome.metrics.map_or(0, |m| m.bytes);
+                        self.log_transfer(relative_path, "download", outcome.metrics);
                     }
                     SyncAction::DeleteLocal { relative_path, .. } => {
                         report.deleted += 1;
-                        self.log_change(relative_path, "delete-local", None);
+                        self.log_change(relative_path, "delete-local", outcome.detail());
                     }
                     SyncAction::DeleteRemote { relative_path, .. } => {
                         report.deleted += 1;
-                        self.log_change(relative_path, "delete-remote", None);
+                        self.log_change(relative_path, "delete-remote", outcome.detail());
                     }
                     SyncAction::Conflict { relative_path, .. } => {
                         report.conflicts += 1;
                         self.log_change(relative_path, "conflict", None);
                     }
-                    SyncAction::CreateLocalDir { .. } | SyncAction::CreateRemoteDir { .. } => {}
+                    // Folder creates were previously silent. A sync that
+                    // only made directories logged nothing at all, so the
+                    // activity feed showed an empty result for real work.
+                    SyncAction::CreateLocalDir { relative_path, .. } => {
+                        report.dirs_created += 1;
+                        self.log_change(relative_path, "create-local-dir", None);
+                    }
+                    SyncAction::CreateRemoteDir { relative_path, .. } => {
+                        report.dirs_created += 1;
+                        self.log_change(relative_path, "create-remote-dir", None);
+                    }
                     SyncAction::Skip { .. } => {
                         report.skipped += 1;
                     }
@@ -286,13 +369,22 @@ impl SyncEngine {
         }
 
         tracing::info!(
-            "Sync complete for '{}': {} up, {} down, {} deleted, {} conflicts, {} errors",
+            "Sync complete for '{}': {} up, {} down, {} dirs, {} deleted, {} conflicts, {} errors",
             self.pair.name,
             report.uploaded,
             report.downloaded,
+            report.dirs_created,
             report.deleted,
             report.conflicts,
             report.errors
+        );
+
+        self.report_status(
+            SyncPhase::Finished,
+            total_actions,
+            total_actions,
+            None,
+            None,
         );
 
         Ok(report)
@@ -562,10 +654,11 @@ impl SyncEngine {
         drive: &dyn DriveClient,
         _local_root: &Path,
         remote_ids: &mut HashMap<String, String>,
-    ) -> anyhow::Result<Option<TransferMetrics>> {
-        // Set by the arms that move bytes; everything else returns None and
-        // is logged without a size or a speed.
-        let mut metrics: Option<TransferMetrics> = None;
+    ) -> anyhow::Result<ActionOutcome> {
+        // Filled in by the arms that have something to report; everything
+        // else logs without a size, a speed, or a detail.
+        let mut outcome = ActionOutcome::default();
+        let metrics = &mut outcome.metrics;
 
         match action {
             SyncAction::Upload {
@@ -588,7 +681,7 @@ impl SyncEngine {
                 tracing::info!("Uploading: {relative_path} (parent {parent_id})");
                 let started = std::time::Instant::now();
                 let file = self.upload_via(drive, &parent_id, &name, local_path).await?;
-                metrics = Some(TransferMetrics::measured(local_size(local_path), started));
+                *metrics = Some(TransferMetrics::measured(local_size(local_path), started));
                 self.update_index(relative_path, local_path, &file)?;
             }
             SyncAction::UpdateRemote {
@@ -599,7 +692,7 @@ impl SyncEngine {
                 tracing::info!("Updating remote: {relative_path}");
                 let started = std::time::Instant::now();
                 let file = self.update_remote_via(drive, remote_id, local_path).await?;
-                metrics = Some(TransferMetrics::measured(local_size(local_path), started));
+                *metrics = Some(TransferMetrics::measured(local_size(local_path), started));
                 self.update_index(relative_path, local_path, &file)?;
             }
             SyncAction::Download {
@@ -612,7 +705,7 @@ impl SyncEngine {
                 self.download_via(drive, remote_id, local_path).await?;
                 // Measure before get_file: that metadata round-trip is not
                 // part of the transfer and would drag the speed down.
-                metrics = Some(TransferMetrics::measured(local_size(local_path), started));
+                *metrics = Some(TransferMetrics::measured(local_size(local_path), started));
                 let file = drive.get_file(remote_id).await?;
                 self.update_index(relative_path, local_path, &file)?;
             }
@@ -626,6 +719,7 @@ impl SyncEngine {
                 // but the paths no longer exist. We still want the index
                 // cleaned up, not a spurious error.
                 if local_path.is_dir() {
+                    outcome.was_directory = true;
                     if let Err(e) = tokio::fs::remove_dir_all(local_path).await {
                         if e.kind() != std::io::ErrorKind::NotFound {
                             return Err(e.into());
@@ -648,6 +742,16 @@ impl SyncEngine {
                 remote_id,
             } => {
                 tracing::info!("Trashing remote: {relative_path}");
+                // Read the indexed entry before deleting it: the local copy
+                // is already gone (that's why we're here), so the index is
+                // the only remaining record of whether this was a folder.
+                outcome.was_directory = self
+                    .db
+                    .with_conn(|conn| FileEntry::get_by_path(conn, &self.pair.id, relative_path))
+                    .ok()
+                    .flatten()
+                    .map(|e| e.is_directory)
+                    .unwrap_or(false);
                 // Trashing a folder cascades to its contents on Drive's side,
                 // so child trash calls afterwards may 404. Treat that as
                 // success — we still want the local index cleaned up.
@@ -716,7 +820,7 @@ impl SyncEngine {
                 tracing::debug!("Skipping {relative_path}: {reason}");
             }
         }
-        Ok(metrics)
+        Ok(outcome)
     }
 
     /// Handle a conflict according to the pair's conflict policy.
@@ -1037,6 +1141,22 @@ impl SyncEngine {
     }
 }
 
+/// What executing one action produced, for the caller to log.
+#[derive(Debug, Clone, Default)]
+struct ActionOutcome {
+    metrics: Option<TransferMetrics>,
+    /// Whether a delete removed a directory rather than a file. The
+    /// activity feed reads "deleted" very differently for a folder, and by
+    /// log time the path is gone so it can no longer be inspected.
+    was_directory: bool,
+}
+
+impl ActionOutcome {
+    fn detail(&self) -> Option<&'static str> {
+        self.was_directory.then_some("folder")
+    }
+}
+
 /// What a single transfer moved, and how long it took.
 #[derive(Debug, Clone, Copy)]
 pub struct TransferMetrics {
@@ -1082,6 +1202,22 @@ fn local_size(path: &Path) -> u64 {
 }
 
 impl SyncAction {
+    /// Stable identifier for this kind of action. Matches the `action`
+    /// values written to the change log, so the live status the UI shows
+    /// mid-sync and the row it shows afterwards use the same vocabulary.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Upload { .. } | Self::UpdateRemote { .. } => "upload",
+            Self::Download { .. } => "download",
+            Self::DeleteLocal { .. } => "delete-local",
+            Self::DeleteRemote { .. } => "delete-remote",
+            Self::CreateLocalDir { .. } => "create-local-dir",
+            Self::CreateRemoteDir { .. } => "create-remote-dir",
+            Self::Conflict { .. } => "conflict",
+            Self::Skip { .. } => "skip",
+        }
+    }
+
     /// Human-readable description for dry-run output.
     pub fn describe(&self) -> String {
         match self {
@@ -1160,17 +1296,19 @@ pub struct SyncReport {
     pub errors: usize,
     pub bytes_uploaded: u64,
     pub bytes_downloaded: u64,
+    pub dirs_created: usize,
 }
 
 impl std::fmt::Display for SyncReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} uploaded ({}), {} downloaded ({}), {} deleted, {} conflicts, {} errors",
+            "{} uploaded ({}), {} downloaded ({}), {} folders created, {} deleted, {} conflicts, {} errors",
             self.uploaded,
             format_bytes(self.bytes_uploaded),
             self.downloaded,
             format_bytes(self.bytes_downloaded),
+            self.dirs_created,
             self.deleted,
             self.conflicts,
             self.errors

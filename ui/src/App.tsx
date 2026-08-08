@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import changelogMd from "../../CHANGELOG.md?raw";
 
-const APP_VERSION = "0.2.5";
+const APP_VERSION = "0.2.6";
 
 type TransferKind = "upload" | "download";
 
@@ -29,6 +29,39 @@ interface UploadEntry extends TransferProgress {
 }
 
 type UploadsByPair = Record<string, Record<string, UploadEntry>>;
+
+type SyncPhase =
+  | "scanning-local"
+  | "listing-remote"
+  | "comparing"
+  | "executing"
+  | "finished";
+
+interface SyncStatus {
+  phase: SyncPhase;
+  done: number;
+  total: number;
+  action: string | null;
+  path: string | null;
+}
+
+interface SyncStatusPayload {
+  syncPairId: string;
+  status: SyncStatus;
+}
+
+type SyncStatusByPair = Record<string, SyncStatus>;
+
+// What each phase is called in the UI. Scanning and listing take real time
+// on a large pair and move no bytes, which is exactly when a sync used to
+// look like it had stalled.
+const PHASE_LABEL: Record<SyncPhase, string> = {
+  "scanning-local": "Scanning local files",
+  "listing-remote": "Listing Drive files",
+  comparing: "Comparing",
+  executing: "Syncing",
+  finished: "Finishing up",
+};
 
 interface Account {
   id: string;
@@ -124,8 +157,15 @@ function App() {
   // that pair's sync finishes (which is the natural moment to drop bars,
   // whether the sync succeeded or errored mid-flight).
   const [uploads, setUploads] = createStore<UploadsByPair>({});
+  // Which phase each pair's in-flight sync is in. Keyed by pair so two
+  // pairs syncing at once don't overwrite each other's indicator.
+  const [syncStatus, setSyncStatus] = createStore<SyncStatusByPair>({});
 
   onMount(() => {
+    const unlistenStatus = listen<SyncStatusPayload>("sync-status", (e) => {
+      const { syncPairId, status } = e.payload;
+      setSyncStatus(produce((s) => { s[syncPairId] = status; }));
+    });
     const unlistenProgress = listen<TransferProgress>("transfer-progress", (e) => {
       const p = e.payload;
       const now = Date.now();
@@ -165,10 +205,12 @@ function App() {
     const unlistenFinished = listen<string>("sync-finished", (e) => {
       const pairId = e.payload;
       setUploads(produce((u) => { delete u[pairId]; }));
+      setSyncStatus(produce((s) => { delete s[pairId]; }));
     });
     onCleanup(() => {
       unlistenProgress.then((u) => u());
       unlistenFinished.then((u) => u());
+      unlistenStatus.then((u) => u());
     });
   });
 
@@ -233,6 +275,7 @@ function App() {
             accounts={accounts() ?? []}
             syncPairs={syncPairs() ?? []}
             uploads={uploads}
+            syncStatus={syncStatus}
             onRefresh={() => { refetchAccounts(); refetchPairs(); }}
             onSelectPair={setSelectedPair}
           />
@@ -429,6 +472,7 @@ function Dashboard(props: {
   accounts: Account[];
   syncPairs: SyncPair[];
   uploads: UploadsByPair;
+  syncStatus: SyncStatusByPair;
   onRefresh: () => void;
   onSelectPair: (id: string | null) => void;
 }) {
@@ -504,6 +548,14 @@ function Dashboard(props: {
       setReconnecting(null);
     }
   }
+
+  // A pair counts as syncing while this window is running its sync, or
+  // while phase events are still arriving — the button-click state alone
+  // misses the window between "sync started" and the first byte moving.
+  const isSyncing = (pairId: string) =>
+    syncing() === pairId ||
+    (props.syncStatus[pairId] != null &&
+      props.syncStatus[pairId].phase !== "finished");
 
   async function handleSync(pair: SyncPair) {
     // Encrypted pair? Make sure the key is in the keyring before kicking
@@ -623,12 +675,25 @@ function Dashboard(props: {
               {(pair) => (
                 <div
                   class="card card-interactive"
+                  classList={{ "card-syncing": isSyncing(pair.id) }}
                   onClick={() => props.onSelectPair(pair.id)}
                 >
                   <div class="card-header">
-                    <span class={`status-dot status-${pair.status}`} />
+                    <span
+                      class={
+                        isSyncing(pair.id)
+                          ? "status-dot status-syncing"
+                          : `status-dot status-${pair.status}`
+                      }
+                    />
                     <div class="card-title">{pair.name}</div>
                     <span class="badge">{pair.mode}</span>
+                    <Show when={isSyncing(pair.id)}>
+                      <span class="badge badge-syncing">
+                        <span class="spinner" aria-hidden="true" />
+                        Syncing
+                      </span>
+                    </Show>
                   </div>
                   <div class="card-body">
                     <div class="path-row">
@@ -639,6 +704,12 @@ function Dashboard(props: {
                       <span class="label">Remote:</span>
                       <code>{pair.remote_root_path}</code>
                     </div>
+                    <Show when={isSyncing(pair.id)}>
+                      <SyncActivity
+                        status={props.syncStatus[pair.id]}
+                        transfers={Object.values(props.uploads[pair.id] ?? {})}
+                      />
+                    </Show>
                     <Show when={Object.keys(props.uploads[pair.id] ?? {}).length > 0}>
                       <div class="upload-progress-list">
                         <For each={Object.values(props.uploads[pair.id] ?? {})}>
@@ -1612,6 +1683,8 @@ function ActivityFeed(props: {
       case "download": return "v";
       case "delete-local":
       case "delete-remote": return "x";
+      case "create-local-dir":
+      case "create-remote-dir": return "+";
       case "conflict": return "!";
       case "resolve": return "*";
       case "error": return "!";
@@ -1654,8 +1727,7 @@ function ActivityFeed(props: {
                 <div class="activity-detail">
                   <div class="activity-path">{entry.relative_path}</div>
                   <div class="activity-meta">
-                    {entry.action}
-                    {entry.detail ? ` - ${entry.detail}` : ""}
+                    {actionLabel(entry)}
                     {" · "}
                     {new Date(entry.created_at).toLocaleString()}
                   </div>
@@ -1675,6 +1747,83 @@ function ActivityFeed(props: {
           </For>
         </div>
       </Show>
+    </div>
+  );
+}
+
+/// What one change-log row says it did, in words rather than the raw
+/// action string. Folder deletes carry detail="folder" from the engine,
+/// which is the only way to tell them apart after the path is gone.
+function actionLabel(entry: ChangeLogEntry): string {
+  const folder = entry.detail === "folder";
+  switch (entry.action) {
+    case "upload": return "uploaded";
+    case "download": return "downloaded";
+    case "delete-local":
+      return folder ? "removed local folder" : "removed locally";
+    case "delete-remote":
+      return folder ? "removed folder from Drive" : "removed from Drive";
+    case "create-local-dir": return "created local folder";
+    case "create-remote-dir": return "created folder on Drive";
+    case "conflict": return "conflict";
+    case "resolve": return "conflict resolved";
+    case "error": return entry.detail ? `error - ${entry.detail}` : "error";
+    default:
+      return entry.detail ? `${entry.action} - ${entry.detail}` : entry.action;
+  }
+}
+
+/// The in-card activity block: what the sync is doing right now, how far
+/// through it is, and how fast bytes are moving.
+function SyncActivity(props: {
+  status: SyncStatus | undefined;
+  transfers: UploadEntry[];
+}) {
+  const STALE_MS = 3000;
+  const live = () =>
+    props.transfers.filter(
+      (t) => t.bytes < t.total && Date.now() - t.lastUpdatedAt < STALE_MS,
+    );
+  const speed = (kind: TransferKind) =>
+    live()
+      .filter((t) => t.kind === kind)
+      .reduce((sum, t) => sum + (t.speedBps ?? 0), 0);
+
+  const phase = () => props.status?.phase ?? "scanning-local";
+  const label = () => PHASE_LABEL[phase()];
+  const total = () => props.status?.total ?? 0;
+  const done = () => props.status?.done ?? 0;
+  // Only "executing" has a meaningful fraction; the earlier phases have no
+  // countable unit of work, so they get an indeterminate bar rather than a
+  // fake percentage.
+  const determinate = () => phase() === "executing" && total() > 0;
+  const pct = () => (determinate() ? Math.round((done() / total()) * 100) : 0);
+
+  return (
+    <div class="sync-activity">
+      <div class="sync-activity-head">
+        <span class="sync-activity-phase">{label()}</span>
+        <Show when={determinate()}>
+          <span class="sync-activity-count">
+            {done()} / {total()}
+          </span>
+        </Show>
+      </div>
+      <div class="sync-activity-bar" classList={{ indeterminate: !determinate() }}>
+        <div
+          class="sync-activity-fill"
+          style={determinate() ? { width: `${pct()}%` } : undefined}
+        />
+      </div>
+      <div class="sync-activity-meta">
+        <span class="sync-activity-path">
+          {props.status?.path ?? "…"}
+        </span>
+        <span class="sync-activity-speed">
+          <Show when={speed("upload") > 0}>↑ {formatSpeed(speed("upload"))} </Show>
+          <Show when={speed("download") > 0}>↓ {formatSpeed(speed("download"))}</Show>
+        </span>
+      </div>
     </div>
   );
 }

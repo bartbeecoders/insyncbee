@@ -16,3 +16,7 @@ Add the following improvments:
 
 - in the activity overview, show thhe upload and download speed
 - add a statistics page where we can see how many files/bytes have been uploaded/downloaded
+
+
+When syncing is ongoing, it is not very clear in the UI, Show a clear activity indication on the main page (per sync pair)
+Alssi show in the activity list, actions like creating, removing folders.

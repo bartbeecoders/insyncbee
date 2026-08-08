@@ -150,3 +150,107 @@ async fn unmeasured_rows_count_as_files_but_not_as_bytes() {
     // this toward zero by contributing a phantom 0-byte transfer.
     assert_eq!(stats.uploaded.average_bps(), Some(2000.0));
 }
+
+// ── Folder actions and phase reporting ──────────────────────────────
+
+/// A sync that only creates folders used to log nothing at all — the
+/// activity feed showed an empty result for real work.
+#[tokio::test]
+async fn folder_creates_are_logged() {
+    let fx = SyncFixture::new(SyncMode::TwoWay);
+    fx.write_local("photos/holiday/beach.txt", BODY);
+
+    let engine = SyncEngine::new(fx.db.clone(), fx.pair.clone());
+    let report = engine.sync(&fx.fake).await.unwrap();
+
+    assert_eq!(report.dirs_created, 2, "photos/ and photos/holiday/");
+
+    let entries = fx
+        .db
+        .with_conn(|conn| ChangeLogEntry::recent(conn, &fx.pair.id, 50))
+        .unwrap();
+    let created: Vec<&str> = entries
+        .iter()
+        .filter(|e| e.action == "create-remote-dir")
+        .map(|e| e.relative_path.as_str())
+        .collect();
+
+    assert!(created.contains(&"photos"), "got: {created:?}");
+    assert!(created.contains(&"photos/holiday"), "got: {created:?}");
+}
+
+/// Deleting a folder must be distinguishable from deleting a file: by log
+/// time the path is gone, so the engine has to record it during execution.
+#[tokio::test]
+async fn folder_deletes_are_marked_as_folders() {
+    let fx = SyncFixture::new(SyncMode::TwoWay);
+    fx.write_local("docs/report.txt", BODY);
+
+    // First sync: the folder and its file land on the remote and get indexed.
+    SyncEngine::new(fx.db.clone(), fx.pair.clone())
+        .sync(&fx.fake)
+        .await
+        .unwrap();
+
+    // Remove the whole folder locally, then sync again.
+    std::fs::remove_dir_all(fx.local_path().join("docs")).unwrap();
+    SyncEngine::new(fx.db.clone(), fx.pair.clone())
+        .sync(&fx.fake)
+        .await
+        .unwrap();
+
+    let entries = fx
+        .db
+        .with_conn(|conn| ChangeLogEntry::recent(conn, &fx.pair.id, 50))
+        .unwrap();
+    let folder_delete = entries
+        .iter()
+        .find(|e| e.action == "delete-remote" && e.relative_path == "docs")
+        .expect("the folder delete should be logged");
+    assert_eq!(
+        folder_delete.detail.as_deref(),
+        Some("folder"),
+        "a folder delete must be marked so the feed doesn't call it a file"
+    );
+}
+
+/// The dashboard indicator is driven entirely by these callbacks. If they
+/// stop firing, a running sync silently looks idle.
+#[tokio::test]
+async fn sync_reports_its_phases_in_order() {
+    use insyncbee_core::sync_engine::{SyncPhase, SyncStatus};
+    use std::sync::{Arc, Mutex};
+
+    let fx = SyncFixture::new(SyncMode::TwoWay);
+    fx.write_local("a.txt", BODY);
+
+    let seen: Arc<Mutex<Vec<SyncStatus>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+
+    let engine = SyncEngine::new(fx.db.clone(), fx.pair.clone())
+        .with_status_callback(Arc::new(move |s| sink.lock().unwrap().push(s)));
+    engine.sync(&fx.fake).await.unwrap();
+
+    let statuses = seen.lock().unwrap();
+    let phases: Vec<SyncPhase> = statuses.iter().map(|s| s.phase).collect();
+
+    assert_eq!(phases.first(), Some(&SyncPhase::ScanningLocal));
+    assert!(phases.contains(&SyncPhase::ListingRemote));
+    assert!(phases.contains(&SyncPhase::Comparing));
+    assert!(phases.contains(&SyncPhase::Executing));
+    assert_eq!(
+        phases.last(),
+        Some(&SyncPhase::Finished),
+        "the UI clears its indicator on Finished; without it the card spins forever"
+    );
+
+    // The executing phase must carry what it is doing, or the card has a
+    // progress bar and nothing to label it with.
+    let executing = statuses
+        .iter()
+        .find(|s| s.phase == SyncPhase::Executing)
+        .expect("an executing status");
+    assert!(executing.total > 0);
+    assert!(executing.action.is_some());
+    assert!(executing.path.is_some());
+}

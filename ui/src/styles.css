@@ -1074,3 +1074,125 @@ body {
   padding: 6px 10px;
   font-size: 13px;
 }
+
+/* ── Per-pair sync activity indicator ────────────────────────── */
+
+.card-syncing {
+  border-color: var(--accent);
+}
+
+.status-dot.status-syncing {
+  background: var(--accent);
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+
+.badge-syncing {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.spinner {
+  width: 10px;
+  height: 10px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.sync-activity {
+  margin-top: 12px;
+  padding: 10px 12px;
+  background: var(--bg-hover);
+  border-radius: var(--radius);
+}
+
+.sync-activity-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 6px;
+}
+
+.sync-activity-phase {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.sync-activity-count {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.sync-activity-bar {
+  position: relative;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.sync-activity-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width 0.3s ease;
+}
+
+/* Scanning and listing have no countable unit of work, so the bar sweeps
+   instead of claiming a percentage it cannot know. */
+.sync-activity-bar.indeterminate .sync-activity-fill {
+  width: 35%;
+  animation: sweep 1.2s ease-in-out infinite;
+}
+
+@keyframes sweep {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(340%); }
+}
+
+.sync-activity-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.sync-activity-path {
+  font-family: var(--mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+.sync-activity-speed {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.action-create-local-dir .activity-icon,
+.action-create-remote-dir .activity-icon {
+  background: #2a2320;
+  color: var(--accent);
+}

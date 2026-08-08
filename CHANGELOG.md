@@ -4,6 +4,24 @@ All notable changes to InSyncBee are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.6] — 2026-08-08
+
+### Added
+- **A running sync is now obvious on the dashboard.** The pair being synced
+  gets an accent border, a pulsing status dot, a "Syncing" badge, and a block
+  showing what the sync is doing right now — the phase (scanning local files,
+  listing Drive, comparing, syncing), how many actions are done out of the
+  total, the file currently being handled, and live up/down speed. Scanning
+  and listing show a sweeping bar rather than a made-up percentage, because
+  those phases have no countable unit of work.
+- **Folder actions appear in the activity feed.** Creating a folder locally or
+  on Drive was the one thing a sync did that left no trace at all, so a cycle
+  that only created directories looked like it had done nothing. Deletes now
+  also distinguish folders from files ("removed local folder" vs "removed
+  locally").
+- Activity rows read as plain language — "uploaded", "created folder on
+  Drive", "removed from Drive" — instead of raw action identifiers.
+
 ## [0.2.5] — 2026-08-08
 
 ### Added

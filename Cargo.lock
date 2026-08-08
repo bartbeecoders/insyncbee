@@ -2146,7 +2146,7 @@ dependencies = [
 
 [[package]]
 name = "insyncbee-core"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2181,7 +2181,7 @@ dependencies = [
 
 [[package]]
 name = "insyncbee-daemon"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2201,7 +2201,7 @@ dependencies = [
 
 [[package]]
 name = "insyncbee-e2e"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2215,7 +2215,7 @@ dependencies = [
 
 [[package]]
 name = "insyncbee-gui"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "chrono",
