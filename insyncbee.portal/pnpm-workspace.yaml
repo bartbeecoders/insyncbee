@@ -1,0 +1,5 @@
+# esbuild's postinstall only fetches/links its platform binary, which pnpm
+# already installs as the @esbuild/<platform> optional dependency. Vite and
+# vitest resolve it from there, so the script is not needed and stays blocked.
+allowBuilds:
+  esbuild: false

@@ -1,2 +1,5 @@
-ignoredBuiltDependencies:
-  - esbuild
+# esbuild's postinstall only fetches/links its platform binary, which pnpm
+# already installs as the @esbuild/linux-x64 optional dependency. Vite resolves
+# it from there, so the script is not needed and stays blocked.
+allowBuilds:
+  esbuild: false
