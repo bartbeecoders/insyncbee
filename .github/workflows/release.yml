@@ -226,6 +226,29 @@ jobs:
           fi
           ls -lh dist/releases/
 
+      # v0.2.2 shipped an AppImage that SIGABRTed before drawing a window
+      # ("Could not create GBM EGL display") on any machine where WebKitGTK's
+      # DMABUF renderer can't reach a GPU. A runner under Xvfb has no GPU
+      # either, so it reproduces exactly that class of failure: if the app is
+      # still alive after 20s it started; any exit inside the window is a
+      # crash worth blocking the release for.
+      - name: Smoke-test the AppImage starts
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: 1
+        run: |
+          set -uo pipefail
+          sudo apt-get install -y --no-install-recommends xvfb
+          APP="dist/releases/${DESKTOP_BASENAME}-${{ needs.prepare.outputs.app_version }}-${LABEL}.AppImage"
+          set +e
+          timeout 20 xvfb-run -a "$APP" --tray 2>&1 | tee /tmp/appimage-smoke.log
+          code=${PIPESTATUS[0]}
+          set -e
+          if [ "$code" -ne 124 ]; then
+            echo "::error::AppImage exited with $code within 20s instead of staying up — see the log above."
+            exit 1
+          fi
+          echo "AppImage was still running after 20s."
+
       - uses: actions/upload-artifact@v4
         with:
           name: desktop-linux-x86_64

@@ -46,7 +46,7 @@ export interface Releases {
 // `version: "…"` and one `releasedAt: "…"` in this file: the deploy-portal
 // sed is unanchored and would rewrite any others too.
 export const DEFAULT_RELEASES: Releases = {
-  version: "0.2.2",
+  version: "0.2.3",
   channel: "dev",
   releasedAt: "2026-08-08",
   repo: "bartbeecoders/insyncbee",
@@ -61,7 +61,7 @@ export const DEFAULT_RELEASES: Releases = {
           os: "linux",
           displayName: "Linux",
           requirement:
-            "GTK 3 + WebKit2GTK 4.1. Install libayatana-appindicator for the tray icon.",
+            "GTK 3 + WebKit2GTK 4.1. Tray support is bundled — nothing extra to install.",
           artifacts: [
             {
               kind: "AppImage",

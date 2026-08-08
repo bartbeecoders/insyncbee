@@ -4,6 +4,26 @@ All notable changes to InSyncBee are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] — 2026-08-08
+
+### Fixed
+- **The desktop app now starts.** On machines where WebKitGTK's DMABUF renderer
+  can't reach a GPU — NVIDIA drivers, VMs, several Wayland compositors — the
+  v0.2.2 app aborted before drawing anything, printing only
+  `Could not create GBM EGL display: EGL_SUCCESS. Aborting...`. It now sets
+  `WEBKIT_DISABLE_DMABUF_RENDERER=1` at startup unless you set it yourself, so
+  `WEBKIT_DISABLE_DMABUF_RENDERER=0` still opts back into the accelerated path.
+  `scripts/dev-gui.sh` had always exported this for development; the shipped
+  app never did.
+- Documentation said the tray icon needed an AppIndicator library installed by
+  hand. It doesn't: the AppImage bundles `libayatana-appindicator3.so.1`, and
+  the `.deb`/`.rpm` declare it as a dependency. Only source builds need it.
+
+### Added
+- The release pipeline now launches the built AppImage under Xvfb and fails if
+  it exits within 20 seconds — a runner has no GPU, so it reproduces exactly
+  the configuration that broke v0.2.2.
+
 ## [0.2.2] — 2026-08-08
 
 ### Added

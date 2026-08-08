@@ -12,10 +12,19 @@ Two things are published for each release, and they are not interchangeable:
 Grab either from [insyncbee.dev](https://insyncbee.dev/#download) or the
 [GitHub Releases page](https://github.com/bartbeecoders/insyncbee/releases).
 
-On Linux the tray icon needs an AppIndicator library present — install
-`libayatana-appindicator3-1` (Debian/Ubuntu), `libappindicator-gtk3` (Fedora),
-or `libayatana-appindicator` (Arch/EndeavourOS). Without it the app still runs,
-but it starts with no tray icon.
+The desktop bundles carry what the tray icon needs: the AppImage ships
+`libayatana-appindicator3.so.1` inside it, and the `.deb`/`.rpm` declare it as
+a package dependency. You only need to install an AppIndicator library by hand
+when building from source — `libayatana-appindicator` on Arch/EndeavourOS,
+`libayatana-appindicator3-dev` on Debian/Ubuntu.
+
+The AppImage is the right choice on Arch/EndeavourOS, where `.deb` and `.rpm`
+are not installable:
+
+```bash
+chmod +x insyncbee-desktop-<version>-linux-x86_64.AppImage
+./insyncbee-desktop-<version>-linux-x86_64.AppImage
+```
 
 macOS and Windows desktop bundles are not published yet: unsigned bundles are
 blocked by Gatekeeper and SmartScreen, and signing needs certificates that

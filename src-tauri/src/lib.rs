@@ -686,7 +686,34 @@ async fn create_drive_folder(
 // ── App Setup ────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// Work around WebKitGTK's DMABUF renderer aborting at startup.
+///
+/// On a fair number of Linux setups — NVIDIA drivers, VMs, several Wayland
+/// compositors — WebKitGTK 2.42+ fails to create a GBM EGL display and calls
+/// `abort()` before a window ever appears:
+///
+/// ```text
+/// Could not create GBM EGL display: EGL_SUCCESS. Aborting...
+/// ```
+///
+/// The app dies with SIGABRT and the user sees nothing at all. `scripts/dev-gui.sh`
+/// has always exported this for development; shipping without it meant every
+/// affected user downloaded an app that could not start.
+///
+/// Only set when unset, so `WEBKIT_DISABLE_DMABUF_RENDERER=0` still opts back
+/// into the accelerated path on hardware where it works.
+#[cfg(target_os = "linux")]
+fn disable_dmabuf_renderer_if_unset() {
+    const VAR: &str = "WEBKIT_DISABLE_DMABUF_RENDERER";
+    if std::env::var_os(VAR).is_none() {
+        std::env::set_var(VAR, "1");
+    }
+}
+
 pub fn run() {
+    #[cfg(target_os = "linux")]
+    disable_dmabuf_renderer_if_unset();
+
     let paths = AppPaths::new().expect("Failed to initialize app paths");
     let db = Database::open(&paths.db_path).expect("Failed to open database");
 
